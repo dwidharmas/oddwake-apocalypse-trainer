@@ -1,0 +1,134 @@
+{
+  "schema": "m01.1",
+  "id": "tuning.m01",
+  "revision": "1",
+  "tick_rate": 60,
+  "root_seed_default": 3101,
+  "timeout_active_ticks": 10800,
+  "timeout_active_seconds": 180,
+  "response": {
+    "deadline_scale": 60,
+    "deadline_base": 0.75,
+    "deadline_int_weight": -0.50,
+    "deadline_bond_weight": -0.10,
+    "deadline_pressure_weight": -0.025,
+    "deadline_fatigue_weight": 0.50,
+    "deadline_min": 0.10,
+    "deadline_max": 1.20,
+    "episode_expiry_ticks": 120,
+    "understood_base": 0.40,
+    "understood_int_weight": 0.50,
+    "understood_bond_weight": 0.10,
+    "understood_pressure_weight": 0.01,
+    "understood_fatigue_weight": -0.30,
+    "understood_min": 0.05,
+    "understood_max": 0.98,
+    "ignore_max": 0.25,
+    "hesitate_wait_ticks": 12,
+    "intent_lifetime_ticks": 480,
+    "strong_int_threshold": 70,
+    "aware_int_threshold": 40
+  },
+  "pressure": {
+    "unit_per_point": 30,
+    "cap_thirtieths": 240,
+    "repeat_credit_thirtieths": 30,
+    "decay_per_tick": 1,
+    "repeat_min_interval_ticks": 6,
+    "excess_threshold_points": 3,
+    "excess_fatigue_add": 3
+  },
+  "fatigue": {
+    "cap_centi": 10000,
+    "request_add": 100,
+    "repeat_add": 100,
+    "technique_start_add": 200,
+    "decay_rest_centi": 10,
+    "decay_move_centi": 5,
+    "decay_technique_centi": 2,
+    "strain_threshold_centi": 3500,
+    "exhausted_threshold_centi": 8000
+  },
+  "exhaustion": {
+    "stam_trigger_cp": 0,
+    "fatigue_trigger_centi": 8000,
+    "lock_ticks": 60,
+    "latch_reset_stam_cp": 1200,
+    "latch_reset_fatigue_centi": 5000,
+    "autonomous_rest_ticks": 60
+  },
+  "regen": {
+    "rest_cp_per_tick": 10,
+    "move_cp_per_tick": 6,
+    "recovery_cp_per_tick": 5,
+    "brace_hold_cp_per_tick": 3,
+    "charge_cp_per_tick": 0,
+    "travel_cp_per_tick": 0,
+    "lock_cp_per_tick": 10
+  },
+  "utility": {
+    "instinct_context_weight": 0.5,
+    "instinct_noise_amplitude": 0.6,
+    "noise_weight_base": 0.5,
+    "tie_favor": "brace"
+  },
+  "npc": {
+    "decision_ticks": 45,
+    "submission_delay_ticks": 12,
+    "health_run_band": ["Wounded", "Critical"],
+    "run_visible_distance_mwu": 2500,
+    "defense_visible_distance_mwu": 1600,
+    "defense_hp_band": "Hurt",
+    "repeat_pending_same_key_once": true
+  },
+  "vision": {
+    "range_mwu": 8000,
+    "memory_ticks": 480,
+    "search_ticks": 360,
+    "planning_ticks": 15,
+    "search_probe_offsets_mwu": [[1000, 0], [-1000, 0], [0, 1000], [0, -1000]]
+  },
+  "defense_fit": {
+    "escape_max_distance_mwu": 2500,
+    "escape_min_gain_mwu": 1000,
+    "escape_bound_fit": 0.90,
+    "escape_brace_fit": 0.25,
+    "hold_max_distance_mwu": 1600,
+    "hold_bound_fit": 0.25,
+    "hold_brace_fit": 0.90,
+    "neutral_min_distance_mwu": 1600,
+    "neutral_max_distance_mwu": 2500,
+    "neutral_fit": 0.50,
+    "run_min_stam_cp": 2000,
+    "run_min_gain_mwu": 1000
+  },
+  "telemetry": {
+    "queue_limit": 4096,
+    "buffer_limit_bytes": 8388608,
+    "checkpoint_ticks": 60,
+    "active_events_per_second_limit": 64,
+    "active_bytes_per_minute_limit": 1048576,
+    "idle_bytes_60s_limit": 65536
+  },
+  "performance": {
+    "sim_mean_ms_per_tick": 2.0,
+    "sim_p95_ms_per_tick": 4.0,
+    "frame_p95_ms": 33.4,
+    "telemetry_overhead_ratio": 0.10,
+    "min_active_seconds_sampled": 60
+  },
+  "presentation": {
+    "reference_viewport": [1280, 720],
+    "minimum_viewport": [1024, 640],
+    "max_text_scale": 2.0,
+    "cue_latency_ms": 100,
+    "min_body_text_px": 16,
+    "min_clickable_px": 44,
+    "response_record_entries": 6
+  },
+  "slots": {
+    "total": 8,
+    "filled": [1, 2, 3],
+    "labels": ["Attack", "Defense", "Run", "Empty", "Empty", "Empty", "Empty", "Empty"]
+  }
+}

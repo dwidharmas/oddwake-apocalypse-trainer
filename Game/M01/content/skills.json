@@ -1,0 +1,59 @@
+{
+  "schema": "m01.1",
+  "revision": "1",
+  "skills": [
+    {
+      "id": "quick_claw",
+      "revision": "1",
+      "family": 1,
+      "target_kind": 2,
+      "stam_cost_cp": 600,
+      "cooldown_ms": 1200,
+      "charge_ms": 0,
+      "recovery_ms": 350,
+      "interrupt_power": 1,
+      "stability": 1,
+      "base_power_cp": 1800,
+      "range_mwu": 1600,
+      "effect_kind": "damage",
+      "quick": true,
+      "feedback_id": "quick_claw"
+    },
+    {
+      "id": "brace",
+      "revision": "1",
+      "family": 2,
+      "target_kind": 1,
+      "stam_cost_cp": 800,
+      "cooldown_ms": 3000,
+      "charge_ms": 450,
+      "recovery_ms": 250,
+      "interrupt_power": 0,
+      "stability": 1,
+      "mitigation_bp": 3500,
+      "active_boundaries": 72,
+      "effect_kind": "mitigate",
+      "quick": false,
+      "feedback_id": "brace"
+    },
+    {
+      "id": "short_bound",
+      "revision": "1",
+      "family": 3,
+      "target_kind": 3,
+      "stam_cost_cp": 1000,
+      "cooldown_ms": 2400,
+      "charge_ms": 300,
+      "recovery_ms": 200,
+      "interrupt_power": 0,
+      "stability": 1,
+      "max_travel_mwu": 2400,
+      "travel_mwu_per_tick": 200,
+      "travel_boundaries": 12,
+      "min_known_path_mwu": 200,
+      "effect_kind": "travel",
+      "quick": false,
+      "feedback_id": "short_bound"
+    }
+  ]
+}

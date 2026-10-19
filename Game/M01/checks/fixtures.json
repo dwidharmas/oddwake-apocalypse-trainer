@@ -1,0 +1,113 @@
+{
+  "schema": "m01.1",
+  "kind": "junior_bounded_fixtures",
+  "id": "fixtures.m01.phase_a_nav",
+  "revision": "1",
+  "purpose": "Bounded diagnostic inputs for the MM-M01-RES01 Phase A development probe (dev_smoke). Product map Game/M01/content/arena.json is unchanged; injected blocked_node and corrupt parent maps are clearly diagnostic and never replace product geometry.",
+  "sources": [
+    "Docs/reviews/qa/QA-RESOURCE-001.md QA-RES-F01 (500 mWU case 648->649->650)",
+    "Docs/reviews/architecture/ARCH-RESOURCE-001.md r2 R-F01 (750 mWU case 976->896->816->736)",
+    "Docs/tasks/MM-M01-RES01.md Phase A item 2"
+  ],
+  "nav_cases": [
+    {
+      "id": "qa_500mwu",
+      "from": [2000, 2000],
+      "to": [2500, 2000],
+      "expect_nodes": [648, 649, 650],
+      "expect_length_mwu": 500
+    },
+    {
+      "id": "qa_500mwu_repeat",
+      "from": [2000, 2000],
+      "to": [2500, 2000],
+      "expect_nodes": [648, 649, 650],
+      "expect_length_mwu": 500
+    },
+    {
+      "id": "qa_500mwu_reversed",
+      "from": [2500, 2000],
+      "to": [2000, 2000],
+      "expect_nodes": [650, 649, 648],
+      "expect_length_mwu": 500
+    },
+    {
+      "id": "qa_adjacent",
+      "from": [2000, 2000],
+      "to": [2250, 2000],
+      "expect_nodes": [648, 649],
+      "expect_length_mwu": 250
+    },
+    {
+      "id": "arch_750mwu",
+      "from": [4000, 3000],
+      "to": [4000, 2250],
+      "expect_nodes": [976, 896, 816, 736],
+      "expect_length_mwu": 750
+    },
+    {
+      "id": "arch_750mwu_reversed",
+      "from": [4000, 2250],
+      "to": [4000, 3000],
+      "expect_nodes": [736, 816, 896, 976],
+      "expect_length_mwu": 750
+    },
+    {
+      "id": "same_node",
+      "from": [4000, 3000],
+      "to": [4000, 3000],
+      "expect_nodes": [976],
+      "expect_length_mwu": 0
+    },
+    {
+      "id": "long_cross_arena",
+      "from": [4000, 3000],
+      "to": [16000, 9000],
+      "expect_length_mwu": 18000
+    },
+    {
+      "id": "unreachable_injected_block",
+      "from": [4000, 3000],
+      "to": [4000, 2250],
+      "blocked_node": 736,
+      "expect_failure": "unreachable"
+    }
+  ],
+  "corrupt_chain_cases": [
+    {
+      "id": "cyclic_pair",
+      "parent": {"816": 896, "896": 816},
+      "goal": 816,
+      "start": 976,
+      "expect_failure": "cycle"
+    },
+    {
+      "id": "self_parent",
+      "parent": {"649": 649},
+      "goal": 649,
+      "start": 648,
+      "expect_failure": "cycle"
+    },
+    {
+      "id": "missing_predecessor",
+      "parent": {"649": 648},
+      "goal": 650,
+      "start": 648,
+      "expect_failure": "missing_predecessor"
+    },
+    {
+      "id": "invalid_endpoint",
+      "parent": {},
+      "goal": -5,
+      "start": 648,
+      "expect_failure": "invalid_endpoint"
+    },
+    {
+      "id": "invalid_predecessor",
+      "parent": {"649": 99999},
+      "goal": 649,
+      "start": 648,
+      "expect_failure": "invalid_predecessor"
+    }
+  ]
+}

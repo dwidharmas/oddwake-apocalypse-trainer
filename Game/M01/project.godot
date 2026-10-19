@@ -1,0 +1,37 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
+config_version=5
+
+[application]
+
+config/name="Monster Mayhem M01 Visible Indirect-Training Encounter"
+config/description="Bounded M01 diagnostic sparring encounter. Placeholder presentation."
+run/main_scene="res://scenes/encounter.tscn"
+config/features=PackedStringArray("4.7", "GL Compatibility")
+run/max_fps=30
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/size/window_width_override=1280
+window/size/window_height_override=720
+
+[editor]
+
+import/use_multiple_threads=false
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+
+[threading]
+
+worker_pool/max_threads=1

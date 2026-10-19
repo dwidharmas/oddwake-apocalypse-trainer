@@ -1,0 +1,23 @@
+# Local OS and editor files
+.DS_Store
+**/.DS_Store
+**/.godot/
+**/__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+**/export_credentials.cfg
+# Local patch residue
+/-.rej
+
+# AI planning, coordination, generated context, and local agent settings
+/Docs/
+/docs/
+/.agents/
+/.codex/
+/.ua/
+/.understand-anything/
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md

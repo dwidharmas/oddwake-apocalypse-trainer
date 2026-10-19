@@ -1,0 +1,19 @@
+{
+  "schema": "m01.1",
+  "id": "behemoth.base",
+  "revision": "1",
+  "species_name": "Behemoth",
+  "stage": "baby_base",
+  "hp_max_cp": 12000,
+  "stam_max_cp": 6000,
+  "atk": 100,
+  "def": 25,
+  "k_defense": 100,
+  "mov_mwu_per_s": 3000,
+  "int_stat": 30,
+  "instinct": 50,
+  "bond": 50,
+  "radius_mwu": 500,
+  "learned_skills": ["quick_claw", "brace", "short_bound"],
+  "presentation_id": "mm_m01_behemoth_baby"
+}

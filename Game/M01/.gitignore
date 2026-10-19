@@ -1,0 +1,4 @@
+.godot/
+*.import
+*.gd.uid
+export_credentials.cfg
