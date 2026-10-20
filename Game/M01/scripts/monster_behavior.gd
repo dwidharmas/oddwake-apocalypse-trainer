@@ -203,7 +203,8 @@ func best_any_bound(actor: Dictionary, enemy_center: Array) -> Dictionary:
 	return _best_from(bound_candidates(actor, enemy_center), -INF)
 
 
-func plan(actor: Dictionary, enemy: Dictionary, tick: int, knowledge_state: String) -> Dictionary:
+func plan(actor: Dictionary, enemy: Dictionary, tick: int, knowledge_state: String,
+		attack_view: Dictionary = {}) -> Dictionary:
 	begin_decision()
 	var family := intent_family(actor)
 	var self_pos := [float(actor["x"]), float(actor["y"])]
@@ -221,18 +222,44 @@ func plan(actor: Dictionary, enemy: Dictionary, tick: int, knowledge_state: Stri
 	var hp_ratio := float(actor["hp"]) / float(actor["hp_max"])
 	var locked := bool(actor["physical_locked"])
 
+	# Expanded Baby: one copied lawful attack-target view, separate from the competing-opponent
+	# threat view used by Defense/Run/autonomous safety. An empty view keeps the legacy path.
+	var atk_center: Array = enemy_center
+	var atk_visible := visible
+	var atk_d := d
+	var atk_ref := {}
+	var atk_mem := {}
+	if not attack_view.is_empty():
+		atk_ref = attack_view.get("ref", {})
+		atk_visible = bool(attack_view.get("visible", false))
+		if atk_visible:
+			atk_center = [float(attack_view.get("x", enemy_center[0])),
+				float(attack_view.get("y", enemy_center[1]))]
+			var ax := float(atk_center[0]) - float(self_pos[0])
+			var ay := float(atk_center[1]) - float(self_pos[1])
+			atk_d = sqrt(ax * ax + ay * ay)
+		else:
+			atk_d = INF
+			atk_mem = attack_view.get("memory", {})
+
 	if family == 0:
-		return _autonomous_plan(actor, enemy, tick, visible, d, hp_ratio, self_pos, enemy_center)
+		var auto := _autonomous_plan(actor, enemy, tick, visible, d, hp_ratio, self_pos,
+			enemy_center, atk_visible, atk_d, atk_center, atk_mem)
+		if not atk_ref.is_empty() and str(auto.get("skill", "")) == "quick_claw":
+			auto["attack_ref"] = atk_ref
+		return auto
 
 	if locked and family == 1:
 		return _rest_plan(actor, "exhausted")
 	if family == 1:
-		if not visible:
+		if not atk_visible:
+			if not atk_mem.is_empty():
+				return _attack_search_plan(actor, atk_mem, atk_ref)
 			if bool(actor["memory_valid"]):
 				return _search_plan(actor, "search")
 			return _scout_plan(actor)
-		if d <= 1600.0 and arena.line_of_effect(float(self_pos[0]), float(self_pos[1]),
-				float(enemy_center[0]), float(enemy_center[1])):
+		if atk_d <= 1600.0 and arena.line_of_effect(float(self_pos[0]), float(self_pos[1]),
+				float(atk_center[0]), float(atk_center[1])):
 			var fits := {}
 			var cands: Array = []
 			if bool(actor["ready"].get("quick_claw", false)) \
@@ -243,9 +270,13 @@ func plan(actor: Dictionary, enemy: Dictionary, tick: int, knowledge_state: Stri
 				# Inside Claw range with no legal Claw (cost/cooldown): ordinary rest.
 				# Out of range is handled below by the ordinary approach goal.
 				return _rest_plan(actor, "cannot_reach")
-			return {"skill": cands[0], "fit_reason": "attack", "fits": fits, "candidates": cands,
-				"knowledge": knowledge_state, "goal": _rest_goal(), "context_family": 1}
-		return _approach_plan(actor, enemy_center)
+			var atk_plan := {"skill": cands[0], "fit_reason": "attack", "fits": fits,
+				"candidates": cands, "knowledge": knowledge_state, "goal": _rest_goal(),
+				"context_family": 1}
+			if not atk_ref.is_empty():
+				atk_plan["attack_ref"] = atk_ref
+			return atk_plan
+		return _approach_plan(actor, atk_center)
 
 	if family == 2:
 		return _defense_plan(actor, enemy, tick, visible, d, self_pos, enemy_center,
@@ -342,7 +373,9 @@ func _run_plan(actor: Dictionary, enemy: Dictionary, tick: int, visible: bool,
 
 
 func _autonomous_plan(actor: Dictionary, enemy: Dictionary, tick: int, visible: bool,
-		d: float, hp_ratio: float, self_pos: Array, enemy_center: Array) -> Dictionary:
+		d: float, hp_ratio: float, self_pos: Array, enemy_center: Array,
+		atk_visible: bool = false, atk_d: float = INF, atk_center: Array = [],
+		atk_mem: Dictionary = {}) -> Dictionary:
 	var knowledge := "unknown"
 	if visible:
 		knowledge = "visible"
@@ -354,17 +387,23 @@ func _autonomous_plan(actor: Dictionary, enemy: Dictionary, tick: int, visible: 
 		return _disengage_plan(actor, enemy_center, knowledge)
 	if visible and d <= 1600.0 and hp_ratio < 0.50:
 		return _defense_plan(actor, enemy, tick, visible, d, self_pos, enemy_center, knowledge)
-	if visible:
+	var hurt := knowledge
+	if atk_visible:
+		if knowledge == "unknown":
+			hurt = "visible"
 		var claw_ok := bool(actor["ready"].get("quick_claw", false)) \
 			and bool(actor["affordable"].get("quick_claw", false))
-		if d <= 1600.0 and claw_ok and arena.line_of_effect(float(self_pos[0]),
-				float(self_pos[1]), float(enemy_center[0]), float(enemy_center[1])):
+		var center: Array = atk_center if not atk_center.is_empty() else enemy_center
+		if atk_d <= 1600.0 and claw_ok and arena.line_of_effect(float(self_pos[0]),
+				float(self_pos[1]), float(center[0]), float(center[1])):
 			return {"skill": "quick_claw", "fit_reason": "attack", "fits": {"quick_claw": 1.0},
 				"candidates": ["quick_claw"], "knowledge": knowledge, "goal": _rest_goal(),
 				"context_family": 1}
 		if claw_ok:
-			return _approach_plan(actor, enemy_center)
+			return _approach_plan(actor, center)
 		return _rest_plan(actor, "not_ready")
+	if not atk_mem.is_empty():
+		return _attack_search_plan(actor, atk_mem, {})
 	if bool(actor["memory_valid"]):
 		return _search_plan(actor, "search")
 	return _scout_plan(actor)
@@ -425,6 +464,24 @@ func _search_plan(actor: Dictionary, reason: String) -> Dictionary:
 			"knowledge": "last_known",
 			"goal": _move_goal(g, route, 0.0, "search")}
 	return _scout_plan(actor)
+
+
+## Lawful frozen last-seen search for a selected attack target. Uses the SAME bounded route
+## tree and expansion ceiling; never selects an unseen replacement life (attack still requires
+## current visibility at _try_start/_release_legal).
+func _attack_search_plan(actor: Dictionary, mem: Dictionary, atk_ref: Dictionary) -> Dictionary:
+	if not bool(mem.get("valid", false)):
+		return _scout_plan(actor)
+	var point: Array = [float(mem.get("x", 0.0)), float(mem.get("y", 0.0))]
+	var self_pos := [float(actor["x"]), float(actor["y"])]
+	var route := _route(self_pos, point)
+	if route.is_empty():
+		return _rest_plan(actor, "unavailable")
+	var plan := {"skill": null, "fit_reason": "search", "fits": {}, "candidates": [],
+		"knowledge": "last_known", "goal": _move_goal(point, route, 0.0, "search")}
+	if not atk_ref.is_empty():
+		plan["attack_ref"] = atk_ref
+	return plan
 
 
 func _scout_plan(actor: Dictionary) -> Dictionary:

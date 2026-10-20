@@ -103,6 +103,11 @@ static func build_trainer_observation(observer: int, tick: int, actors: Array,
 	own_labels["control"] = int(own["control_mode"])
 	own_labels["skills"] = own["loadout_skill_ids"].duplicate()
 	own_labels["slot_labels"] = own["slot_labels"].duplicate()
+	own_labels["life_id"] = int(own.get("life_id", 1))
+	var own_alive := bool(own.get("alive", true))
+	var rdue := int(own.get("return_due", -1))
+	own_labels["status"] = "alive" if own_alive else \
+		("waiting_return" if rdue >= 0 and tick >= rdue else "down")
 	own_labels["affordable"] = {}
 	for sid in own["loadout_skill_ids"]:
 		if str(sid) == "":

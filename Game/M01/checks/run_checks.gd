@@ -35,10 +35,14 @@ const DEFAULT_OUT := "res://../../Docs/junior/evidence/MM-M01-001/R01"
 
 const SUITES: Array[String] = ["dev_smoke", "smoke", "contracts", "geometry", "response",
 	"behavior", "hidden", "authority", "telemetry", "stats", "performance", "play01_focus",
-	"all"]
+	"baby_growth_revival", "all"]
 
 const DEV_SMOKE_MAX_TICKS := 120
 const DEV_SMOKE_WALL_MS := 3000
+
+## Expanded Baby opt-in profile: seed3101, <=120 actual steps, absolute3000ms deadline.
+const BABY_WALL_MS := 3000
+const BABY_MAX_STEPS := 120
 
 ## RUN01 fixed focused profile limits. Both are stops, not measured compliance claims.
 const PLAY01_FOCUS_WALL_MS := 3000
@@ -61,6 +65,14 @@ const DEV_SMOKE_IDS: Array[String] = ["C00-content-load", "D00-fixtures-load",
 	"D04-nav-work-budget", "D05-timeout-predicate", "D06-probe-timeout",
 	"D07-remaining-budget-oracle"]
 
+## Expanded Baby finite profile. Every row is authored here and NOT RUN until separately released.
+const BABY_IDS: Array[String] = ["B01-content-mode", "B02-observation-symmetry",
+	"B03-target-selection", "B04-prey-flee-bound", "B05-collision-four-body",
+	"B06-credit-overkill", "B07-duplicate-depletion-reward", "B08-reward-cap",
+	"B09-stat-hold-reset", "B10-prey-respawn-blocked", "B11-monster-ko-return",
+	"B12-mutual-ko-effects", "B13-end-precedence", "B14-telemetry-schema",
+	"B15-safe-projection", "B16-action-categories", "B17-legacy-preservation"]
+
 var results: Array = []
 var started_msec := 0
 var content: M01Content
@@ -78,6 +90,7 @@ var profile_name := ""
 var profile_seed := 3101
 var checked_sink := false
 var focus_active := false
+var baby_active := false
 var stopped := false
 var stop_reason := ""
 var stop_noted := false
@@ -113,7 +126,8 @@ func _initialize() -> void:
 	profile_name = suite
 	profile_seed = seed_override if seed_override > 0 else 3101
 	focus_active = suite == "play01_focus"
-	checked_sink = suite == "play01_focus" or suite == "dev_smoke"
+	baby_active = suite == "baby_growth_revival"
+	checked_sink = suite == "play01_focus" or suite == "dev_smoke" or suite == "baby_growth_revival"
 	_stage_enter("arguments")
 	print("SUITE %s" % suite)
 	if not SUITES.has(suite):
@@ -162,6 +176,9 @@ func _initialize() -> void:
 		"play01_focus":
 			# RUN01 fixed profile: no seed override reaches it; its own fixtures pin 3101.
 			_suite_play01_focus()
+		"baby_growth_revival":
+			# Expanded Baby fixed profile: seed and fixtures pin 3101; not in default fanout.
+			_suite_baby_growth_revival()
 		"all":
 			_suite_contracts()
 			_suite_geometry()
@@ -223,6 +240,7 @@ func _new_telemetry(seed_v: int, mode_v: String, fixture_id: String = "") -> M01
 	var t := M01Telemetry.new()
 	t.reset()
 	t.build_header({
+		"schema": "m01.2" if mode_v == "baby_growth_revival" else "m01.1",
 		"mode": mode_v,
 		"fixture_id": fixture_id if fixture_id != "" else null,
 		"engine": Engine.get_version_info().get("string", "unknown"),
@@ -423,9 +441,19 @@ func _pstep(sim: M01Simulation) -> void:
 			_stop("play01_focus absolute deadline exhausted during a step")
 			return
 		step_attempts += 1
+	elif baby_active:
+		if step_attempts >= BABY_MAX_STEPS:
+			_stop("baby_growth_revival step ceiling %d reached" % BABY_MAX_STEPS)
+			return
+		if not _baby_remaining_ok():
+			_stop("baby_growth_revival absolute deadline exhausted during a step")
+			return
+		step_attempts += 1
 	var before := int(sim.tick)
 	sim.step()
 	if focus_active and int(sim.tick) != before:
+		step_completed += 1
+	if baby_active and int(sim.tick) != before:
 		step_completed += 1
 
 
@@ -433,7 +461,7 @@ func _pstep(sim: M01Simulation) -> void:
 ## never reports it as step-budget consumption (the cited expiry diagnostics reach tick 961 by
 ## assignment, not by 961 boundaries).
 func _mtick(sim: M01Simulation, value: int) -> void:
-	if focus_active:
+	if focus_active or baby_active:
 		manual_ticks += 1
 	sim.tick = value
 
@@ -444,6 +472,35 @@ func _focus_remaining_ms() -> int:
 
 func _focus_remaining_ok() -> bool:
 	return _focus_remaining_ms() > 0
+
+
+func _baby_remaining_ms() -> int:
+	return (started_msec + BABY_WALL_MS) - Time.get_ticks_msec()
+
+
+func _baby_remaining_ok() -> bool:
+	return _baby_remaining_ms() > 0
+
+
+func _baby_gate(id: String) -> bool:
+	if stopped:
+		_not_run(id, stop_reason)
+		return false
+	current_case = id
+	case_steps_before = step_attempts
+	if not _baby_remaining_ok():
+		_stop("baby_growth_revival absolute deadline exhausted before " + id)
+		_not_run(id, stop_reason)
+		return false
+	return true
+
+
+func _baby_end() -> void:
+	var used := step_attempts - case_steps_before
+	if used > case_steps_max:
+		case_steps_max = used
+	if not _baby_remaining_ok():
+		_stop("baby_growth_revival absolute deadline exhausted after " + current_case)
 
 
 func _stop(reason: String) -> void:
@@ -495,6 +552,8 @@ func _expected_ids() -> Array:
 		return PLAY01_FOCUS_IDS
 	if profile_name == "dev_smoke":
 		return DEV_SMOKE_IDS
+	if profile_name == "baby_growth_revival":
+		return BABY_IDS
 	return []
 
 
@@ -543,6 +602,8 @@ func _sink_deadline_ms() -> int:
 		return started_msec + PLAY01_FOCUS_WALL_MS
 	if profile_name == "dev_smoke" and dev_smoke_t0 > 0:
 		return dev_smoke_t0 + DEV_SMOKE_WALL_MS
+	if profile_name == "baby_growth_revival":
+		return started_msec + BABY_WALL_MS
 	return 0
 
 
@@ -2483,6 +2544,1430 @@ func _suite_performance(seed_v: int) -> void:
 		_append_note("C91 sample budget", "only %.1f active seconds collected" % active_seconds)
 
 
+## Expanded Baby opt-in profile. Not part of the default or `all` fanout. Every row is authored
+## here and remains NOT RUN until a separately released execution.
+func _suite_baby_growth_revival() -> void:
+	var fx := _load_fixtures()
+	var grp := {}
+	if bool(fx["ok"]):
+		grp = (fx["data"] as Dictionary).get("baby_growth_revival", {})
+	if _baby_gate("B01-content-mode"):
+		_baby_case_content(grp)
+		_baby_end()
+	if _baby_gate("B02-observation-symmetry"):
+		_baby_case_observation()
+		_baby_end()
+	if _baby_gate("B03-target-selection"):
+		_baby_case_targeting()
+		_baby_end()
+	if _baby_gate("B04-prey-flee-bound"):
+		_baby_case_prey_flee()
+		_baby_end()
+	if _baby_gate("B05-collision-four-body"):
+		_baby_case_collision()
+		_baby_end()
+	if _baby_gate("B06-credit-overkill"):
+		_baby_case_credit()
+		_baby_end()
+	if _baby_gate("B07-duplicate-depletion-reward"):
+		_baby_case_depletion()
+		_baby_end()
+	if _baby_gate("B08-reward-cap"):
+		_baby_case_reward_cap()
+		_baby_end()
+	if _baby_gate("B09-stat-hold-reset"):
+		_baby_case_stat_hold()
+		_baby_end()
+	if _baby_gate("B10-prey-respawn-blocked"):
+		_baby_case_respawn()
+		_baby_end()
+	if _baby_gate("B11-monster-ko-return"):
+		_baby_case_ko_return()
+		_baby_end()
+	if _baby_gate("B12-mutual-ko-effects"):
+		_baby_case_mutual()
+		_baby_end()
+	if _baby_gate("B13-end-precedence"):
+		_baby_case_end()
+		_baby_end()
+	if _baby_gate("B14-telemetry-schema"):
+		_baby_case_schema()
+		_baby_end()
+	if _baby_gate("B15-safe-projection"):
+		_baby_case_projection()
+		_baby_end()
+	if _baby_gate("B16-action-categories"):
+		_baby_case_categories()
+		_baby_end()
+	if _baby_gate("B17-legacy-preservation"):
+		_baby_case_legacy()
+		_baby_end()
+
+
+func _baby_sim() -> M01Simulation:
+	return _new_sim(3101, "baby_growth_revival")
+
+
+## Freezes normal autonomous planning so a case can inject an exact due effect and run the real
+## production `step` without unrelated starts.
+func _baby_freeze(sim: M01Simulation) -> void:
+	for i in 2:
+		sim.actors[i]["next_plan_tick"] = 1000000
+		sim.actors[i]["enemy_visible"] = false
+		sim.actors[i]["memory_valid"] = false
+		sim.plan_watch[i] = sim._plan_watch(sim.actors[i])
+
+
+func _baby_damage_effect(eid: int, source: int, kind: String, id: int, life: int,
+		power: int) -> Dictionary:
+	return {"effect": eid, "action": 0, "source": source, "kind": "damage",
+		"impact_tick": 0, "interrupt_power": 1, "qualification": "qualified", "batch": 0,
+		"base_power_cp": power, "source_atk": 100, "target_def": 0,
+		"brace_factor_bp": 10000, "phase_factor_bp": 10000,
+		"target_ref": {"kind": kind, "id": id, "life_id": life},
+		"target_life_id": life, "source_life_id": 1,
+		"target": 0 if kind == "monster" else 2 + id}
+
+
+func _baby_case_content(grp: Dictionary) -> void:
+	var bad: Array = []
+	if int(content.compiled.get("baby_prey_respawn_ticks", -1)) != 900:
+		bad.append("respawn ticks")
+	if int(content.compiled.get("baby_return_ticks", -1)) != 300:
+		bad.append("return ticks")
+	if int(content.compiled.get("baby_diagnostic_ticks", -1)) != 5400:
+		bad.append("diagnostic ticks")
+	if int(content.tuning["timeout_active_ticks"]) != 10800:
+		bad.append("legacy global timeout changed")
+	if grp.is_empty() or str(grp.get("id", "")) != "fixtures.m01.baby_growth_revival":
+		bad.append("fixtures group missing")
+	var s := _baby_sim()
+	if s.prey_slots.size() != 2:
+		bad.append("prey slots %d != 2" % s.prey_slots.size())
+	if int(s.actors[0]["x"]) != 2000 or int(s.actors[0]["y"]) != 10000 \
+			or int(s.actors[1]["x"]) != 18000 or int(s.actors[1]["y"]) != 2000:
+		bad.append("nest spawns not applied")
+	if int(s.actors[0]["radius"]) != 500:
+		bad.append("monster radius changed")
+	if int(s.prey_slots[0]["hp"]) != 2400 or int(s.prey_slots[0]["radius"]) != 250:
+		bad.append("prey values")
+	if int(s.progression[0]["pending_atk"]) != 0 or int(s.progression[0]["evolution_exp"]) != 0:
+		bad.append("ledger not zero")
+	var leg := _new_sim(3101, "live")
+	if not leg.prey_slots.is_empty() or leg.is_expanded():
+		bad.append("legacy mode gained prey")
+	# C08: missing expanded section and nonpositive damage k must fail truthfully at load.
+	var species_copy := content.species.duplicate(true)
+	var tuning_copy := content.tuning.duplicate(true)
+	content.tuning.erase("baby_growth_revival")
+	content.errors.clear()
+	content._validate_baby_growth()
+	if content.errors.is_empty():
+		bad.append("missing expanded section was accepted")
+	content.tuning["baby_growth_revival"] = tuning_copy["baby_growth_revival"]
+	content.species["k_defense"] = 0
+	content.errors.clear()
+	content._validate_baby_growth()
+	if content.errors.is_empty():
+		bad.append("nonpositive k_defense was accepted")
+	content.species = species_copy
+	content.errors.clear()
+	content._validate_baby_growth()
+	if content.baby_section().is_empty():
+		bad.append("valid section not restored after negatives")
+	_record("B01-content-mode", bad.is_empty(), "compiled ticks 900/300/5400, legacy timeout 10800, 2 prey at centres, Nest spawns, zero ledgers, missing-section/nonpositive-k rejected; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_observation() -> void:
+	var s := _baby_sim()
+	var bad: Array = []
+	# C13/B02: deliberately ASYMMETRIC own states so a swapped own-state source cannot pass.
+	s.actors[0]["hp"] = 3000
+	s.actors[1]["hp"] = 12000
+	s.actors[0]["stam"] = 1000
+	s.actors[1]["stam"] = 6000
+	s.actors[0]["control_mode"] = 1
+	s.actors[1]["control_mode"] = 0
+	s.actors[0]["int_stat"] = 10
+	s.actors[1]["int_stat"] = 90
+	s.actors[0]["life_id"] = 3
+	s.actors[1]["life_id"] = 5
+	# Distinct readiness/affordability: side0 cannot pay Quick and has it on cooldown; side1 can.
+	s.actors[0]["stam"] = 100
+	s.actors[1]["stam"] = 6000
+	s.actors[0]["cooldown_end"]["quick_claw"] = 100
+	s.actors[1]["cooldown_end"]["quick_claw"] = 0
+	s._refresh_gates(s.actors[0])
+	s._refresh_gates(s.actors[1])
+	var o0: Dictionary = s.observe_for(0)
+	var o1: Dictionary = s.observe_for(1)
+	if int((o0["own"] as Dictionary).get("observer", -1)) != 0:
+		bad.append("observer0 own")
+	if int((o1["own"] as Dictionary).get("observer", -1)) != 1:
+		bad.append("observer1 own")
+	if int((o0["own"] as Dictionary).get("hp_band", -1)) != 2 \
+			or int((o1["own"] as Dictionary).get("hp_band", -1)) != 4:
+		bad.append("own hp bands not mapped per side (0=%d 1=%d)" % [
+			int((o0["own"] as Dictionary).get("hp_band", -1)),
+			int((o1["own"] as Dictionary).get("hp_band", -1))])
+	if str((o0["own"] as Dictionary).get("stam_label", "")) == \
+			str((o1["own"] as Dictionary).get("stam_label", "")):
+		bad.append("own stamina mapping identical across asymmetric sides")
+	if int((o0["own"] as Dictionary).get("control", -1)) != 1 \
+			or int((o1["own"] as Dictionary).get("control", -1)) != 0:
+		bad.append("own control not mapped per side")
+	if int((o1["own"] as Dictionary).get("life_id", -1)) != 5 \
+			or int((o0["own"] as Dictionary).get("life_id", -1)) != 3:
+		bad.append("own life_id not mapped per side")
+	var r0: Dictionary = (o0["own"] as Dictionary).get("ready", {})
+	var r1: Dictionary = (o1["own"] as Dictionary).get("ready", {})
+	var a0: Dictionary = (o0["own"] as Dictionary).get("affordable", {})
+	var a1: Dictionary = (o1["own"] as Dictionary).get("affordable", {})
+	if bool(a0.get("quick_claw", false)) or not bool(a1.get("quick_claw", false)):
+		bad.append("own affordability not mapped per side")
+	if bool(r0.get("quick_claw", false)) == bool(r1.get("quick_claw", false)):
+		bad.append("own readiness not mapped per side")
+	if int((o0["enemy"] as Dictionary).get("knowledge", -1)) != 0:
+		bad.append("starter enemies should be out of vision")
+	_record("B02-observation-symmetry", bad.is_empty(),
+		"asymmetric own hp/stam/control/life map per side after canonical ordering; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_targeting() -> void:
+	var s := _baby_sim()
+	var a: Dictionary = s.actors[0]
+	a["x"] = 6000.0
+	a["y"] = 6000.0
+	a["enemy_visible"] = true
+	s.actors[1]["x"] = 6300.0
+	s.actors[1]["y"] = 6000.0
+	s.prey_slots[0]["x"] = 6300.0
+	s.prey_slots[0]["y"] = 6000.0
+	s.prey_slots[1]["x"] = 13000.0
+	s.prey_slots[1]["y"] = 6000.0
+	var bad: Array = []
+	var tie := s._select_attack_target(a)
+	if str(tie.get("kind", "")) != "monster":
+		bad.append("equal-distance tie did not prefer opponent")
+	a["enemy_visible"] = false
+	var prey_pick := s._select_attack_target(a)
+	if str(prey_pick.get("kind", "")) != "prey" or int(prey_pick.get("id", -1)) != 0:
+		bad.append("nearest visible prey not chosen")
+	# stale generation is not retained
+	a["selected_target"] = {"kind": "prey", "id": 0, "life_id": 99}
+	var refreshed := s._select_attack_target(a)
+	if int(refreshed.get("life_id", -1)) != 1:
+		bad.append("stale target life retained")
+	# hidden prey never selected
+	s.prey_slots[0]["live"] = false
+	s.prey_slots[1]["x"] = 19000.0
+	s.prey_slots[1]["y"] = 11000.0
+	a["enemy_visible"] = false
+	if not s._select_attack_target(a).is_empty():
+		bad.append("hidden prey selected")
+	# C06: paired observer-equivalent worlds whose hidden prey LIFE state differs must keep the
+	# same frozen last-seen search until a lawful observation or expiry (no hidden-state leak).
+	var k0 := _baby_sim()
+	var k1 := _baby_sim()
+	for kk in [k0, k1]:
+		kk.actors[0]["x"] = 6000.0
+		kk.actors[0]["y"] = 6000.0
+		kk.actors[0]["enemy_visible"] = false
+		kk.actors[0]["memory_valid"] = false
+		kk.prey_slots[0]["x"] = 8000.0
+		kk.prey_slots[0]["y"] = 6000.0
+		kk.prey_slots[0]["live"] = true
+		kk._update_prey_knowledge()
+		kk.actors[0]["selected_target"] = {"kind": "prey", "id": 0, "life_id": 1}
+		# Move the prey far out of vision so only frozen memory remains.
+		kk.prey_slots[0]["x"] = 19000.0
+		kk.prey_slots[0]["y"] = 11000.0
+		kk._update_prey_knowledge()
+	# Hidden life change in only world k1.
+	k1.prey_slots[0]["life_id"] = 2
+	k1.prey_slots[0]["live"] = true
+	var sel0 := k0._select_attack_target(k0.actors[0])
+	var sel1 := k1._select_attack_target(k1.actors[0])
+	if str(sel0.get("kind", "")) != "prey" or str(sel1.get("kind", "")) != "prey":
+		bad.append("frozen prey search lost without lawful observation")
+	elif int(sel0.get("life_id", -1)) != int(sel1.get("life_id", -1)):
+		bad.append("hidden prey life change altered frozen search")
+	# Expiry still retires it lawfully.
+	k0.actors[0]["prey_knowledge"][0]["memory_valid"] = false
+	if not k0._select_attack_target(k0.actors[0]).is_empty():
+		bad.append("expired frozen prey search not retired")
+	_record("B03-target-selection", bad.is_empty(),
+		"opponent tie, nearest visible prey, stale-life refresh, hidden denial, frozen-search parity; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_prey_flee() -> void:
+	var s := _baby_sim()
+	var p: Dictionary = s.prey_slots[0]
+	p["x"] = 6000.0
+	p["y"] = 6000.0
+	s.actors[0]["x"] = 6000.0
+	s.actors[0]["y"] = 5600.0
+	var draws_before: Dictionary = s.stream_draws.duplicate(true)
+	s._prey_plan_cut()
+	var draws_after: Dictionary = s.stream_draws.duplicate(true)
+	var bad: Array = []
+	if (p["route"] as Array).is_empty():
+		bad.append("no flee route")
+	if s.prey_expansion_total > 3840:
+		bad.append("expansions %d > 3840" % s.prey_expansion_total)
+	if draws_before != draws_after:
+		bad.append("prey planning consumed competing RNG")
+	s.actors[0]["alive"] = false
+	s._prey_plan_cut()
+	if not (p["route"] as Array).is_empty():
+		bad.append("threat loss did not stop movement")
+	# C04: cursor advances only through vertices the committed polyline actually reaches.
+	var c := _baby_sim()
+	var cp: Dictionary = c.prey_slots[0]
+	cp["route"] = [[6250.0, 6000.0], [6250.0, 6250.0]]
+	cp["route_i"] = 0
+	var step := 1600.0 / 60.0
+	# Applied 26.6667 from (6220,6000) reaches x=6246.6667: 3.3333 short of the first corner.
+	c._advance_prey_cursor(cp, [6220.0, 6000.0], step)
+	if int(cp["route_i"]) != 0:
+		bad.append("cursor skipped an unreached corner (i=%d)" % int(cp["route_i"]))
+	cp["route"] = [[6250.0, 6000.0], [6250.0, 6250.0]]
+	cp["route_i"] = 0
+	c._advance_prey_cursor(cp, [6220.0, 6000.0], 60.0)
+	if int(cp["route_i"]) < 1:
+		bad.append("cursor did not consume a genuinely reached corner")
+	# Producer-level: the movement cut must pass the PRE-step origin, not the applied endpoint.
+	var pr := _baby_sim()
+	var pp2: Dictionary = pr.prey_slots[0]
+	pp2["x"] = 6220.0
+	pp2["y"] = 6000.0
+	pp2["route"] = [[6250.0, 6000.0], [6250.0, 6250.0]]
+	pp2["route_i"] = 0
+	pp2["threat"] = 0
+	pr._movement_cut_baby()
+	if int(pp2["route_i"]) != 0:
+		bad.append("producer movement cut skipped an unreached corner")
+	# S4/B04: a static clip truncates the applied arc BEFORE the corner; the cursor must not
+	# consume the unreached vertex.
+	var cl := _baby_sim()
+	var cpz: Dictionary = cl.prey_slots[0]
+	cpz["x"] = 19730.0
+	cpz["y"] = 6000.0
+	cpz["route"] = [[19760.0, 6000.0], [19760.0, 6250.0]]
+	cpz["route_i"] = 0
+	cpz["threat"] = 0
+	cl._movement_cut_baby()
+	if int(cpz["route_i"]) != 0:
+		bad.append("static-clipped arc consumed an unreached corner")
+	if float(cpz["x"]) >= 19760.0 - 1e-6:
+		bad.append("static clip did not truncate before the corner (x=%.4f)" % float(cpz["x"]))
+	_record("B04-prey-flee-bound", bad.is_empty(),
+		"bounded single-tree flee, no RNG draw, immediate stop, producer partial/static-clipped arc; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_collision() -> void:
+	var bad: Array = []
+	# R1: mover -> ORIGINALLY STATIONARY body first (t=0.4), then a later moving/stationary
+	# contact (t=0.75). The consumed first pair must not be rediscovered or abort resolution.
+	var s := _baby_sim()
+	s.actors[0]["x"] = 4000.0
+	s.actors[0]["y"] = 6000.0
+	s.actors[1]["x"] = 5020.0
+	s.actors[1]["y"] = 6000.0
+	_force_move_goal(s, 1, [4800, 6000])
+	s.prey_slots[0]["x"] = 7000.0
+	s.prey_slots[0]["y"] = 6000.0
+	s.prey_slots[0]["threat"] = -1
+	s.prey_slots[0]["route"] = []
+	s.prey_slots[1]["x"] = 7520.0
+	s.prey_slots[1]["y"] = 6000.0
+	s.prey_slots[1]["route"] = [[7200.0, 6000.0]]
+	s.prey_slots[1]["route_i"] = 0
+	s.prey_slots[1]["threat"] = 0
+	s.pair_test_total = 0
+	s.movement_contract_failures = 0
+	s._movement_cut_baby()
+	if s.movement_contract_failures != 0:
+		bad.append("R1 no-progress when a later contact follows a consumed stopped pair")
+	if s.pair_test_total > 24:
+		bad.append("pair tests %d > 24" % s.pair_test_total)
+	# Stationary monster0 must not be shoved; mover monster1 freezes at its t=0.4 contact.
+	if absf(float(s.actors[0]["x"]) - 4000.0) > 1e-6:
+		bad.append("stationary body was displaced")
+	if absf(float(s.actors[1]["x"]) - 5000.0) > 1.0:
+		bad.append("mover did not freeze at its applied contact endpoint (x=%.3f)" % float(s.actors[1]["x"]))
+	# Later moving->stationary prey contact resolves at t=0.75.
+	if absf(float(s.prey_slots[0]["x"]) - 7000.0) > 1e-6:
+		bad.append("stationary prey was displaced")
+	if absf(float(s.prey_slots[1]["x"]) - 7500.0) > 1.0:
+		bad.append("later mover did not freeze at its applied contact endpoint (x=%.3f)" % float(s.prey_slots[1]["x"]))
+	var d_mon := _dist([float(s.actors[0]["x"]), float(s.actors[0]["y"])],
+		[float(s.actors[1]["x"]), float(s.actors[1]["y"])])
+	if d_mon < 1000.0 - 1.0:
+		bad.append("monster pair overlapped after freeze %.3f" % d_mon)
+	var d_prey := _dist([float(s.prey_slots[0]["x"]), float(s.prey_slots[0]["y"])],
+		[float(s.prey_slots[1]["x"]), float(s.prey_slots[1]["y"])])
+	if d_prey < 500.0 - 1.0:
+		bad.append("prey pair overlapped after later freeze %.3f" % d_prey)
+	# S4/B05(a): a later mover contacts a PREVIOUSLY FROZEN body (monster1 at t=0.4), and an
+	# independent noncontact body keeps its own full displacement.
+	var sA := _baby_sim()
+	sA.actors[0]["x"] = 4000.0
+	sA.actors[0]["y"] = 6000.0
+	sA.actors[1]["x"] = 5020.0
+	sA.actors[1]["y"] = 6000.0
+	_force_move_goal(sA, 1, [4800, 6000])
+	sA.prey_slots[0]["x"] = 5770.0
+	sA.prey_slots[0]["y"] = 6000.0
+	sA.prey_slots[0]["route"] = [[5400.0, 6000.0]]
+	sA.prey_slots[0]["route_i"] = 0
+	sA.prey_slots[0]["threat"] = 1
+	sA.prey_slots[1]["x"] = 7000.0
+	sA.prey_slots[1]["y"] = 2000.0
+	sA.prey_slots[1]["route"] = [[7200.0, 2000.0]]
+	sA.prey_slots[1]["route_i"] = 0
+	sA.prey_slots[1]["threat"] = 0
+	sA.pair_test_total = 0
+	sA.movement_contract_failures = 0
+	sA._movement_cut_baby()
+	if sA.movement_contract_failures != 0:
+		bad.append("S4 mover-vs-frozen contact aborted")
+	if absf(float(sA.actors[1]["x"]) - 5000.0) > 1.0:
+		bad.append("first mover did not freeze at t=0.4")
+	if absf(float(sA.prey_slots[0]["x"]) - 5750.0) > 1.0:
+		bad.append("later mover did not stop against the FROZEN body (x=%.3f)" % float(sA.prey_slots[0]["x"]))
+	var independent_step := 1600.0 / 60.0
+	if absf(float(sA.prey_slots[1]["x"]) - (7000.0 + independent_step)) > 1e-3:
+		bad.append("independent noncontact body did not keep its own displacement")
+	# S4/B05(b): sparse side1 Bound plus one live unrelated prey.
+	var s2 := _baby_sim()
+	s2.actors[0]["alive"] = false
+	s2.actors[0]["lifecycle"] = "down"
+	s2.prey_slots[0]["live"] = true
+	s2.prey_slots[0]["x"] = 14000.0
+	s2.prey_slots[0]["y"] = 9000.0
+	s2.prey_slots[0]["route"] = [[14100.0, 9000.0]]
+	s2.prey_slots[0]["route_i"] = 0
+	s2.prey_slots[0]["threat"] = 0
+	s2.prey_slots[1]["live"] = false
+	s2.actors[1]["x"] = 18000.0
+	s2.actors[1]["y"] = 2000.0
+	s2.actors[1]["bound_active"] = true
+	s2.actors[1]["bound_path"] = [[18000.0, 2000.0], [18000.0, 1500.0]]
+	s2.actors[1]["bound_total"] = 500.0
+	s2.actors[1]["bound_progress"] = 0.0
+	s2.actors[1]["bound_action"] = 9
+	s2.pair_test_total = 0
+	s2.movement_contract_failures = 0
+	var prey_start := [14000.0, 9000.0]
+	var prey_end := [14100.0, 9000.0]
+	var prey_radius := float(s2.prey_slots[0]["radius"])
+	# The initial separation exceeds BOTH entire path lengths plus the contact radii.
+	var separate := _dist(prey_start, [18000.0, 2000.0]) > 100.0 + 500.0 \
+		+ prey_radius + float(s2.actors[1]["radius"]) + s2.arena.GUARD
+	var legal_segment := s2.arena.static_legal_for(14000.0, 9000.0, prey_radius) \
+		and s2.arena.static_legal_for(14100.0, 9000.0, prey_radius) \
+		and s2.arena.swept_static_limit_for(prey_start, prey_end, prey_radius) >= 1.0 - 1e-9
+	if not legal_segment or not separate or not bool(s2.actors[1]["alive"]) \
+			or bool(s2.actors[0]["alive"]) or bool(s2.prey_slots[1]["live"]) \
+			or prey_radius != 250.0 or float(s2.content.baby_section()["prey"]["mov_mwu_per_s"]) != 1600.0:
+		bad.append("S4 sparse Bound/prey fixture is not statically and dynamically separate")
+	else:
+		s2._movement_cut_baby()
+		if s2.movement_contract_failures != 0:
+			bad.append("S4 sparse Bound no-progress with a live prey")
+		if float(s2.actors[1]["bound_progress"]) <= 0.0:
+			bad.append("S4 side1 Bound did not advance with side0 down")
+		if s2.pair_test_total > 24:
+			bad.append("S4 sparse Bound/prey pair ceiling exceeded")
+		if absf(float(s2.prey_slots[0]["x"]) - (14000.0 + 1600.0 / 60.0)) > 1e-3 \
+				or absf(float(s2.prey_slots[0]["y"]) - 9000.0) > 1e-3:
+			bad.append("S4 unrelated live prey did not keep its full independent step")
+	_record("B05-collision-four-body", bad.is_empty(),
+		"stationary-first contacts, later mover-vs-frozen, independent body, sparse Bound+prey (pairs=%d/%d, failures=%d/%d); problems=[%s]" % [
+			s.pair_test_total, sA.pair_test_total, s2.movement_contract_failures,
+			sA.movement_contract_failures, ", ".join(bad)])
+
+
+func _baby_case_credit() -> void:
+	var s := _baby_sim()
+	var bad: Array = []
+	var even: Array = s._allocate_credit(2400, 2000, 2000)
+	if int(even[0]) != 1200 or int(even[1]) != 1200:
+		bad.append("even split %s" % str(even))
+	var odd: Array = s._allocate_credit(1, 1, 1)
+	if int(odd[0]) != 1 or int(odd[1]) != 0:
+		bad.append("odd remainder tie not side0: %s" % str(odd))
+	var zero := s._allocate_credit(0, 0, 0)
+	if int(zero[0]) != 0 or int(zero[1]) != 0:
+		bad.append("zero damage credited")
+	var no_contrib := s._allocate_credit(500, 0, 0)
+	if int(no_contrib[0]) != 0 or int(no_contrib[1]) != 0:
+		bad.append("no-contributor credit %s != [0,0]" % str(no_contrib))
+	var overkill := s._allocate_credit(2400, 3000, 100)
+	if int(overkill[0]) + int(overkill[1]) != 2400:
+		bad.append("overkill credited beyond actual HP loss")
+	_record("B06-credit-overkill", bad.is_empty(),
+		"integer largest-remainder allocation, exact zero no-contributor, overkill excluded, side0 remainder tie; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_depletion() -> void:
+	var s := _baby_sim()
+	s.prey_slots[0]["hp"] = 2400
+	s.pending_effects = [
+		_baby_damage_effect(1, 0, "prey", 0, 1, 2000),
+		_baby_damage_effect(2, 1, "prey", 0, 1, 2000),
+	]
+	s._cut5_baby()
+	var bad: Array = []
+	var p: Dictionary = s.prey_slots[0]
+	if bool(p["live"]):
+		bad.append("prey not depleted")
+	if int((p["credited"] as Array)[0]) != 1200 or int((p["credited"] as Array)[1]) != 1200:
+		bad.append("credit %s" % str(p["credited"]))
+	var atk_after := int(s.progression[0]["pending_atk"])
+	# duplicate callback must not re-award
+	s.pending_effects = []
+	s._cut5_baby()
+	if int(s.progression[0]["pending_atk"]) != atk_after:
+		bad.append("duplicate depletion re-awarded")
+	if _events_of_type(s, 28).size() != 1:
+		bad.append("HUNT_REWARD rows %d != 1" % _events_of_type(s, 28).size())
+	if _events_of_type(s, 27).size() != 1:
+		bad.append("prey lifecycle rows %d != 1" % _events_of_type(s, 27).size())
+	# C13: same-boundary two-slot award in ascending slot order, and a down winner still keeps
+	# its persistent credit.
+	var two := _baby_sim()
+	two.progression[0]["credited_defeats"] = 0
+	two.prey_slots[0]["hp"] = 2400
+	two.prey_slots[1]["hp"] = 2400
+	two.pending_effects = [
+		_baby_damage_effect(1, 0, "prey", 0, 1, 2400),
+		_baby_damage_effect(2, 0, "prey", 1, 1, 2400),
+	]
+	two.actors[0]["alive"] = false
+	two.actors[0]["lifecycle"] = "down"
+	two.actors[0]["return_due"] = 9999
+	two._cut5_baby()
+	var rewards := _events_with_tick(two, 28)
+	if rewards.size() != 2:
+		bad.append("same-boundary awards %d != 2" % rewards.size())
+	elif int((rewards[0][1] as Array)[0]) != 0 or int((rewards[1][1] as Array)[0]) != 1:
+		bad.append("same-boundary slot order not ascending")
+	if int(two.progression[0]["pending_atk"]) != 3 or int(two.progression[0]["evolution_exp"]) != 15:
+		bad.append("same-boundary schedule %d/%d != 3/15" % [
+			int(two.progression[0]["pending_atk"]), int(two.progression[0]["evolution_exp"])])
+	_record("B07-duplicate-depletion-reward", bad.is_empty(),
+		"one award per life, grouped credit 1200/1200, duplicate inert, ascending two-slot award, down-winner credit; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_reward_cap() -> void:
+	var s := _baby_sim()
+	var grp := {"d": [2000, 0], "effects": [], "hp_start": 2400}
+	s.prey_slots[0]["credited"] = [2000, 0]
+	s.prey_slots[0]["first_credit"] = [1, -1]
+	s._award_prey(0, grp)
+	var first := [int(s.progression[0]["pending_atk"]), int(s.progression[0]["evolution_exp"])]
+	s.prey_slots[0]["credited"] = [2000, 0]
+	s._award_prey(0, grp)
+	var second := [int(s.progression[0]["pending_atk"]), int(s.progression[0]["evolution_exp"])]
+	s.prey_slots[0]["credited"] = [2000, 0]
+	s._award_prey(0, grp)
+	var third := [int(s.progression[0]["pending_atk"]), int(s.progression[0]["evolution_exp"])]
+	var bad: Array = []
+	if first != [2, 10] or second != [3, 15] or third != [3, 15]:
+		bad.append("reward schedule %s/%s/%s" % [str(first), str(second), str(third)])
+	# zero-reward later defeat shows no positive growth cue
+	var growth_rows := 0
+	for e in s.human_feedback:
+		if str(e.get("kind", "")) == "growth":
+			growth_rows += 1
+	if growth_rows != 2:
+		bad.append("growth cues %d != 2 (third is zero)" % growth_rows)
+	_record("B08-reward-cap", bad.is_empty(),
+		"first +2/+10, second +1/+5, third 0, zero repeats silent; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_stat_hold() -> void:
+	var s := _baby_sim()
+	var atk0 := int(s.actors[0]["atk"])
+	var def0 := int(s.actors[0]["def"])
+	var hp_max0 := int(s.actors[0]["hp_max"])
+	var grp := {"d": [2000, 0], "effects": [], "hp_start": 2400}
+	s.prey_slots[0]["credited"] = [2000, 0]
+	s.prey_slots[0]["first_credit"] = [1, -1]
+	s._award_prey(0, grp)
+	var bad: Array = []
+	if int(s.actors[0]["atk"]) != atk0 or int(s.actors[0]["def"]) != def0 \
+			or int(s.actors[0]["hp_max"]) != hp_max0:
+		bad.append("pending award changed live stats")
+	if int(s.progression[0]["pending_atk"]) != 2:
+		bad.append("ledger not stored")
+	var s2 := _baby_sim()
+	if int(s2.progression[0]["pending_atk"]) != 0 or int(s2.progression[0]["evolution_exp"]) != 0:
+		bad.append("fresh encounter kept ledger")
+	_record("B09-stat-hold-reset", bad.is_empty(),
+		"no continuous stat change; fresh encounter zeroes ledgers; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_respawn() -> void:
+	var s := _baby_sim()
+	var bad: Array = []
+	var cands := arena.placement_candidates([6000.0, 6000.0], [1000, 2000])
+	if cands.size() != 17:
+		bad.append("candidates %d != 17" % cands.size())
+	if absf(float(cands[1][0]) - 7000.0) > 1e-6:
+		bad.append("east offset wrong")
+	var diag := 1000.0 / sqrt(2.0)
+	if absf(float(cands[2][0]) - (6000.0 + diag)) > 1e-6 \
+			or absf(float(cands[2][1]) - (6000.0 + diag)) > 1e-6:
+		bad.append("diagonal component not radius/sqrt2")
+	var p: Dictionary = s.prey_slots[0]
+	p["live"] = false
+	p["respawn_due"] = s.tick
+	p["radius"] = 1.0e9
+	s._process_due_lifecycles(0)
+	if int(p["life_id"]) != 1 or bool(p["live"]):
+		bad.append("blocked placement incremented generation")
+	if not bool(p["spawn_wait_announced"]):
+		bad.append("blocked wait not announced")
+	var waits := _rows_with_field(_events_with_tick(s, 27), 0, "spawn_wait")
+	s._process_due_lifecycles(0)
+	if _rows_with_field(_events_with_tick(s, 27), 0, "spawn_wait").size() != waits.size():
+		bad.append("wait re-announced while still blocked")
+	p["radius"] = 250.0
+	s._process_due_lifecycles(0)
+	if int(p["life_id"]) != 2 or not bool(p["live"]) or int(p["hp"]) != 2400:
+		bad.append("legal respawn did not increment generation once")
+	if int((p["credited"] as Array)[0]) != 0:
+		bad.append("contributor totals not reset")
+	# R8/B10: per-candidate evaluation, real-radius centre blockage, finite all-candidate
+	# blockage (bounded synthetic radius), original due retention, and serialized row order.
+	var b := _baby_sim()
+	var bp: Dictionary = b.prey_slots[0]
+	bp["live"] = false
+	bp["respawn_due"] = b.tick + 2
+	bp["spawn_wait_announced"] = false
+	b.actors[1]["x"] = 6000.0
+	b.actors[1]["y"] = 6000.0
+	var before_tests := b.placement_test_total
+	_mtick(b, b.tick + 1)
+	b._process_due_lifecycles(0)
+	if bool(bp["live"]) or int(bp["life_id"]) != 1:
+		bad.append("due-1 spawned early")
+	var due_saved := int(bp["respawn_due"])
+	_mtick(b, int(due_saved))
+	b._process_due_lifecycles(0)
+	if not bool(bp["live"]) or int(bp["life_id"]) != 2:
+		bad.append("due respawn with a legal-radius alternate did not spawn")
+	if b.placement_test_total - before_tests != 2:
+		bad.append("centre-blocked placement tested %d candidates != 2" % (
+			b.placement_test_total - before_tests))
+	# All 17 candidates blocked (finite synthetic radius) at the legal candidate list size.
+	var c := _baby_sim()
+	var cps: Dictionary = c.prey_slots[0]
+	cps["live"] = false
+	cps["respawn_due"] = c.tick + 1
+	cps["spawn_wait_announced"] = false
+	cps["radius"] = 6000.0
+	var cbefore := c.placement_test_total
+	_mtick(c, int(cps["respawn_due"]))
+	c._process_due_lifecycles(0)
+	if bool(cps["live"]) or int(cps["life_id"]) != 1:
+		bad.append("all-candidate blockage spawned")
+	if int(cps["respawn_due"]) != int(c.tick):
+		bad.append("blocked due tick was renewed")
+	if c.placement_test_total - cbefore != 17:
+		bad.append("all-candidate blockage tested %d != 17" % (
+			c.placement_test_total - cbefore))
+	# Stable simultaneous order: compare serialized row POSITION, not absolute ticks.
+	var o := _baby_sim()
+	o.actors[0]["alive"] = false
+	o.actors[0]["lifecycle"] = "down"
+	o.actors[0]["return_due"] = o.tick + 1
+	o.prey_slots[0]["live"] = false
+	o.prey_slots[0]["respawn_due"] = o.tick + 1
+	_mtick(o, o.tick + 1)
+	o._process_due_lifecycles(0)
+	var lc := _events_with_tick(o, 27)
+	var idx_monster := -1
+	var idx_spawn := -1
+	for k in lc.size():
+		var pay: Array = (lc[k] as Array)[1]
+		if str(pay[0]) == "monster_return" and idx_monster < 0:
+			idx_monster = k
+		if str(pay[0]) == "prey_spawn" and idx_spawn < 0:
+			idx_spawn = k
+	if idx_monster < 0 or idx_spawn < 0 or idx_monster > idx_spawn:
+		bad.append("simultaneous placement serialized order not monster-before-prey")
+	_record("B10-prey-respawn-blocked", bad.is_empty(),
+		"17-candidate per-candidate count, real-radius centre block, finite all-candidate blockage, original due retention, serialized order; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_ko_return() -> void:
+	var s := _baby_sim()
+	var bad: Array = []
+	# C13/B11: seed dirty resources/locks/action/queues plus nonzero persistent build/ledger,
+	# then a real KO/return must fully reset lifetime state and preserve build/ledger/IDs.
+	var a: Dictionary = s.actors[0]
+	a["atk"] = 150
+	a["instinct"] = 77
+	a["learned"]["quick_claw"] = true
+	s.progression[0]["pending_atk"] = 2
+	s.progression[0]["evolution_exp"] = 10
+	s.progression[0]["credited_defeats"] = 1
+	s.pending_effects = [_baby_damage_effect(1, 1, "monster", 0, 1, 20000)]
+	s._cut5_baby()
+	if bool(a["alive"]) or str(a["lifecycle"]) != "down":
+		bad.append("monster not temporarily down")
+	if s.ended:
+		bad.append("temporary KO ended the encounter")
+	if int(a["return_due"]) != s.tick + 300:
+		bad.append("return due %d != now+300" % int(a["return_due"]))
+	if not s.ko_actors.is_empty():
+		bad.append("terminal ko_actors set on temporary KO")
+	var rejected := s.gateway.validate({"schema": "m01.1", "trainer": 0, "actor": 0,
+		"sequence": 1, "slot": 0, "family": 1, "target_kind": 0, "target_or_area": null,
+		"observed_tick": s.tick, "source_life": 1}, s.tick + 1, s.actors, s.trainer_owner)
+	if bool(rejected["ok"]) or str(rejected["reason"]) != "life":
+		bad.append("down input not truthfully rejected")
+	# Dirty the state AFTER KO so the return must clear it, and stage old-life input + NPC queue.
+	a["fatigue_centi"] = 9000
+	a["lock_end"] = 500
+	a["lock_latched"] = true
+	a["physical_locked"] = true
+	a["emotion"] = "Frenzy"
+	a["control_mode"] = 2
+	# Complete production-shaped dirty records: cut1/cut2 read them BEFORE cut5 returns.
+	# Brace charges for 27 ticks (450ms), so it stays preparing through return at now+1.
+	var dirty_due := s.tick + s.content.charge_ticks("brace")
+	var dirty_cooldown := s.tick + s.content.cooldown_ticks("brace")
+	var dirty_skill: Dictionary = s.content.skill("brace")
+	a["action"] = {"action": 5, "actor": 0, "life": int(a["life"]), "life_id": int(a["life_id"]),
+		"target_ref": {}, "target_life_id": null,
+		"request": 1, "episode": 1, "intent": 1, "owning_family": 2,
+		"skill": "brace", "target": null, "target_kind": 1, "start_tick": s.tick,
+		"due_tick": dirty_due, "recovery_ticks": s.content.recovery_ticks("brace"),
+		"paid_cost": int(dirty_skill["stam_cost_cp"]), "cooldown_end": dirty_cooldown,
+		"stability": int(dirty_skill["stability"]), "interrupt_power": int(dirty_skill["interrupt_power"]),
+		"state": "preparing", "cancel_cause": "",
+		"plan": {"skill": "brace", "goal": null, "context_family": 2}}
+	a["response_episode"] = {"episode": 1, "key": "2|none", "family": 2,
+		"target_kind": 0, "target_or_area": null, "first_request": 1, "latest_request": 1,
+		"issue_tick": s.tick, "response_due": s.tick + 100, "expiry_tick": s.tick + 1000,
+		"pre_issuance_fatigue": 0, "pressure_at_issue": 0, "draw_resolved": false,
+		"hesitation_end": -1, "class": 0, "original_family": 2, "interpreted_family": 2,
+		"observation_category": "defense"}
+	a["accepted_intent"] = {"intent": 1, "episode": 1, "request": 1, "family": 2,
+		"accepted_tick": s.tick, "expiry_tick": s.tick + 1000, "state": "active",
+		"target_kind": 0, "target_or_area": null, "goal": null, "observation_category": "defense"}
+	a["goal"] = {"kind": "move", "purpose": "search", "point": [8000.0, 6000.0],
+		"route": [[4000.0, 3000.0], [8000.0, 6000.0]], "i": 0, "stop_mwu": 0.0, "patrol_index": -1}
+	a["pressure"] = 200
+	a["npc"]["queued"] = {"decision": 7, "observation_tick": s.tick,
+		"submission_due_tick": s.tick + 10, "sequence": 8, "slot": 1, "family": 1,
+		"target_kind": 0, "target_or_area": null, "source_life": int(a["life_id"]),
+		"revalidated_observation_tick": s.tick, "observation_category": "attack"}
+	# Old valid knowledge/search influence must be replaced, not confused with fresh sensing.
+	a["enemy_visible"] = false
+	a["memory_valid"] = true
+	a["memory_x"] = 8000.0
+	a["memory_y"] = 6000.0
+	a["memory_token"] = 3
+	a["memory_last_seen_tick"] = s.tick
+	a["memory_expiry"] = s.tick + 1000
+	a["search_active"] = true
+	a["search_start"] = s.tick
+	a["search_deadline"] = s.tick + 1000
+	a["search_visited"] = [[7000.0, 6000.0]]
+	a["patrol_visited"] = [0]
+	a["prey_knowledge"] = [
+		{"kind": "prey", "id": 0, "life_id": 1, "visible": false, "x": 8000.0, "y": 6000.0,
+			"last_seen_tick": 0, "expiry": 1000, "memory_valid": true, "token": 3,
+			"visited": [[7000.0, 6000.0]]},
+		s._new_knowledge(1)]
+	a["hp"] = 5
+	a["stam"] = 5
+	a["cooldown_end"]["quick_claw"] = 999
+	a["cooldown_end"]["brace"] = dirty_cooldown
+	a["recovery_end"] = 999
+	var loadout_before: Array = (a["loadout_skill_ids"] as Array).duplicate()
+	s.gateway.last_accepted_sequence[0] = 7
+	s.gateway.next_request_id = 8
+	s.trainer_ai.decision_id = 11
+	a["npc"]["decision_id"] = 11
+	s.selection_draw_count = [3, 4]
+	s.stream_draws["monster.side0"] = 5
+	s.gateway.stage({"schema": "m01.1", "trainer": 0, "actor": 0, "sequence": 1, "slot": 0,
+		"family": 1, "target_kind": 0, "target_or_area": null, "observed_tick": s.tick}, s.tick + 5, 1)
+	var held_seq := int(s.gateway.last_accepted_sequence.get(0, 0))
+	var rng_before := s.stream_draws.duplicate(true)
+	var draws_before: Array = (s.selection_draw_count as Array).duplicate()
+	var request_id_before := s.gateway.next_request_id
+	var decision_id_before := s.trainer_ai.decision_id
+	# Force the return onto the NEXT real production boundary with planning pressure present.
+	a["return_due"] = s.tick + 1
+	a["next_plan_tick"] = 0
+	s.actors[1]["x"] = 3200.0
+	s.actors[1]["y"] = 10000.0
+	var return_tick := int(a["return_due"])
+	if dirty_due <= return_tick or int(a["response_episode"]["response_due"]) <= return_tick \
+			or int(a["response_episode"]["expiry_tick"]) <= return_tick \
+			or int(a["accepted_intent"]["expiry_tick"]) <= return_tick:
+		bad.append("dirty action/episode/intent must remain pending until return restoration")
+	# Keep the NPC from drawing on this boundary so the RNG/draw retention assertion isolates
+	# the return path; actor0 is down during cut2 and cannot act anyway.
+	s.actors[1]["next_plan_tick"] = 1000000
+	s.actors[1]["npc"]["next_decision_tick"] = 1000000
+	s.plan_watch[1] = s._plan_watch(s.actors[1])
+	_pstep(s)
+	if not bool(a["alive"]) or int(a["life_id"]) != 2:
+		bad.append("return did not restore exactly once")
+	if not _rows_with_field(_events_with_tick(s, 6), 1, 0).filter(
+			func(row): return int(row[0]) == return_tick).is_empty():
+		bad.append("ACTION_START occurred on the return boundary")
+	# cut6 senses AFTER restoration: prey0 is visible from the Nest on this boundary.
+	var fresh: Dictionary = a["prey_knowledge"][0]
+	var live_prey: Dictionary = s.prey_slots[0]
+	if not s._los_vision(a, [float(live_prey["x"]), float(live_prey["y"])]) \
+			or not bool(fresh["visible"]) or not bool(fresh["memory_valid"]) \
+			or int(fresh["life_id"]) != int(live_prey["life_id"]) \
+			or int(fresh["last_seen_tick"]) != return_tick or int(fresh["token"]) != 1 \
+			or float(fresh["x"]) != float(live_prey["x"]) or float(fresh["y"]) != float(live_prey["y"]) \
+			or not (fresh["visited"] as Array).is_empty() \
+			or (float(fresh["x"]) == 8000.0 and float(fresh["y"]) == 6000.0):
+		bad.append("old prey token/coordinates/search survived or fresh return sensing is missing")
+	if not bool(a["enemy_visible"]) or not bool(a["memory_valid"]) \
+			or int(a["memory_last_seen_tick"]) != return_tick or int(a["memory_token"]) != 4 \
+			or float(a["memory_x"]) != float(s.actors[1]["x"]) \
+			or float(a["memory_y"]) != float(s.actors[1]["y"]) or bool(a["search_active"]) \
+			or int(a["search_start"]) != -1 or int(a["search_deadline"]) != -1 \
+			or not (a["search_visited"] as Array).is_empty() or not (a["patrol_visited"] as Array).is_empty() \
+			or not (a["search_token_exhausted"] as Dictionary).is_empty():
+		bad.append("old competitor search influence survived lawful fresh reacquisition")
+	if int(a["fatigue_centi"]) != 0 or int(a["control_mode"]) != 0 or a["action"] != null \
+			or int(a["lock_end"]) != 0 or bool(a["lock_latched"]) or bool(a["physical_locked"]) \
+			or str(a["emotion"]) != "Calm" or a["response_episode"] != null \
+			or a["accepted_intent"] != null or a["goal"] != null or int(a["pressure"]) != 0 \
+			or a["npc"]["queued"] != null or not s.gateway.staged.is_empty():
+		bad.append("return restoration incomplete (dirty lifetime state survived)")
+	if int(a["hp"]) != int(a["hp_max"]) or int(a["stam"]) != int(a["stam_max"]):
+		bad.append("return did not restore full HP/STAM")
+	if int(a["cooldown_end"]["quick_claw"]) != s.tick \
+			or int(a["cooldown_end"]["brace"]) != s.tick or int(a["recovery_end"]) != s.tick:
+		bad.append("cooldown/recovery not ready at the return tick")
+	if int(a["atk"]) != 150 or int(a["instinct"]) != 77:
+		bad.append("build not preserved across return")
+	if (a["loadout_skill_ids"] as Array) != loadout_before:
+		bad.append("loadout not preserved across return")
+	if int(s.progression[0]["pending_atk"]) != 2 or int(s.progression[0]["evolution_exp"]) != 10 \
+			or int(s.progression[0]["credited_defeats"]) != 1:
+		bad.append("ledger not preserved across return")
+	if int(s.gateway.last_accepted_sequence.get(0, 0)) != held_seq:
+		bad.append("sequence reset by return")
+	if s.gateway.next_request_id != request_id_before or s.trainer_ai.decision_id != decision_id_before \
+			or int(a["npc"]["decision_id"]) != 11:
+		bad.append("nonzero request/decision IDs reset or consumed at return")
+	if s.stream_draws != rng_before or (s.selection_draw_count as Array) != draws_before:
+		bad.append("RNG/draw counters reset by return")
+	if a["action"] != null:
+		bad.append("action started on the return boundary")
+	# Next production boundary may act; the return boundary itself must not.
+	s.actors[1]["x"] = 3200.0
+	s.actors[1]["y"] = 10000.0
+	_pstep(s)
+	if a["action"] == null and a["goal"] == null:
+		bad.append("no planning/action occurred on the next production boundary")
+	_record("B11-monster-ko-return", bad.is_empty(),
+		"dirty lifetime state cleared, full HP/STAM/cooldown reset, build/loadout/ledger/IDs/RNG preserved, next-boundary action; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_mutual() -> void:
+	var bad: Array = []
+	# C01(a): a valid committed prior arrival settles exactly once through the REAL step, with
+	# matching IMPACT/DAMAGE and actual-loss credit.
+	var s := _baby_sim()
+	_baby_freeze(s)
+	var e0 := _baby_damage_effect(1, 0, "prey", 0, 1, 500)
+	e0["impact_tick"] = 1
+	s.pending_effects = [e0]
+	_pstep(s)
+	var p0: Dictionary = s.prey_slots[0]
+	if int((p0["credited"] as Array)[0]) != 500:
+		bad.append("valid prior arrival did not settle once")
+	if _events_with_tick(s, 12).size() != 1:
+		bad.append("DAMAGE rows %d != 1" % _events_with_tick(s, 12).size())
+	if _events_with_tick(s, 11).size() != 1:
+		bad.append("IMPACT rows %d != 1" % _events_with_tick(s, 11).size())
+	# C01(b): a down source's already-committed valid effect still contributes.
+	var s2 := _baby_sim()
+	_baby_freeze(s2)
+	s2.actors[0]["alive"] = false
+	s2.actors[0]["lifecycle"] = "down"
+	s2.actors[0]["return_due"] = 9999
+	var e1 := _baby_damage_effect(2, 0, "prey", 0, 1, 500)
+	e1["impact_tick"] = 1
+	s2.pending_effects = [e1]
+	_pstep(s2)
+	if int(((s2.prey_slots[0]["credited"] as Array))[0]) != 500:
+		bad.append("down-source committed effect was discarded")
+	# C01(c): an obsolete captured target life cannot interrupt or damage the replacement.
+	var s3 := _baby_sim()
+	_baby_freeze(s3)
+	s3.actors[0]["life_id"] = 2
+	s3.actors[0]["action"] = {"action": 77, "actor": 0, "life": 1, "life_id": 2,
+		"request": 0, "episode": 0, "intent": -1, "owning_family": 2, "skill": "brace",
+		"target": null, "target_kind": 1, "start_tick": 0, "due_tick": 5, "recovery_ticks": 15,
+		"paid_cost": 0, "cooldown_end": 0, "stability": 1, "interrupt_power": 0,
+		"state": "preparing", "cancel_cause": "", "plan": {}}
+	var e2 := _baby_damage_effect(3, 1, "monster", 0, 1, 500)
+	e2["impact_tick"] = 1
+	s3.pending_effects = [e2]
+	var hp_before := int(s3.actors[0]["hp"])
+	_pstep(s3)
+	if s3.actors[0]["action"] == null:
+		bad.append("obsolete target life interrupted the replacement")
+	if not _rows_with_field(_events_with_tick(s3, 10), 3, "interruption").is_empty():
+		bad.append("obsolete target life emitted an interruption")
+	if not _rows_with_field(_events_with_tick(s3, 11), 5, "hit").is_empty():
+		bad.append("obsolete target life emitted a hit")
+	if int(s3.actors[0]["hp"]) != hp_before:
+		bad.append("obsolete target life damaged the replacement monster")
+	if not _rows_with_field(_events_with_tick(s3, 12), 1, 0).is_empty():
+		bad.append("obsolete target life emitted DAMAGE on the replacement")
+	# R2: nonempty INCOMPLETE captured identity must fail safely (no key access, no damage).
+	var s4 := _baby_sim()
+	_baby_freeze(s4)
+	var e3 := {"effect": 4, "action": 0, "source": 0, "kind": "damage", "impact_tick": 1,
+		"interrupt_power": 1, "qualification": "qualified", "batch": 0,
+		"base_power_cp": 500, "source_atk": 100, "target_def": 0,
+		"brace_factor_bp": 10000, "phase_factor_bp": 10000,
+		"target_ref": {"kind": "prey", "life_id": 1}, "target": 2}
+	s4.pending_effects = [e3]
+	var hp4 := int(s4.prey_slots[0]["hp"])
+	_pstep(s4)
+	if int(s4.prey_slots[0]["hp"]) != hp4 or int(((s4.prey_slots[0]["credited"] as Array))[0]) != 0:
+		bad.append("incomplete identity damaged/credited an entity")
+	if not _rows_with_field(_events_with_tick(s4, 11), 5, "hit").is_empty():
+		bad.append("incomplete identity emitted a hit")
+	# S4/R2: a missing (empty) captured identity through the actual step is inert.
+	var s7 := _baby_sim()
+	_baby_freeze(s7)
+	var e5 := {"effect": 8, "action": 0, "source": 0, "kind": "damage", "impact_tick": 1,
+		"interrupt_power": 1, "qualification": "qualified", "batch": 0,
+		"base_power_cp": 500, "source_atk": 100, "target_def": 0,
+		"brace_factor_bp": 10000, "phase_factor_bp": 10000,
+		"target_ref": {}, "target": 2}
+	s7.pending_effects = [e5]
+	var hp7 := int(s7.prey_slots[0]["hp"])
+	_pstep(s7)
+	if int(s7.prey_slots[0]["hp"]) != hp7 \
+			or int(((s7.prey_slots[0]["credited"] as Array))[0]) != 0:
+		bad.append("missing identity damaged/credited an entity")
+	if not _rows_with_field(_events_with_tick(s7, 11), 5, "hit").is_empty():
+		bad.append("missing identity emitted a hit")
+	if not _rows_with_field(_events_with_tick(s7, 10), 2, 8).is_empty():
+		bad.append("missing identity emitted a CANCEL")
+	if not _rows_with_field(_events_with_tick(s7, 12), 1, 2).is_empty():
+		bad.append("missing identity emitted target DAMAGE")
+	# R8: valid expanded monster prior arrival settles once against the TARGET monster.
+	var s5 := _baby_sim()
+	_baby_freeze(s5)
+	var e4 := _baby_damage_effect(5, 0, "monster", 1, 1, 500)
+	e4["impact_tick"] = 1
+	s5.pending_effects = [e4]
+	var m1_hp := int(s5.actors[1]["hp"])
+	var m1_def := int(s5.actors[1]["def"])
+	var m1_k := int(s5.actors[1]["k_defense"])
+	_pstep(s5)
+	# S2: default DEF25/k100 mitigation yields round(500 * 100/100 * 100/125) = 400.
+	var expected_loss := 400
+	if int(s5.actors[1]["hp"]) != m1_hp - expected_loss:
+		bad.append("valid monster arrival HP %d != expected %d (DEF=%d k=%d)" % [
+			int(s5.actors[1]["hp"]), m1_hp - expected_loss, m1_def, m1_k])
+	var mon_dmg := _rows_with_field(_events_with_tick(s5, 12), 1, 1)
+	if mon_dmg.is_empty():
+		bad.append("valid monster arrival emitted no target DAMAGE")
+	else:
+		var dp: Array = (mon_dmg[0] as Array)[1]
+		if dp.size() != 11 or int(dp[8]) != expected_loss or int(dp[0]) != 5:
+			bad.append("target DAMAGE effective/identity %d/%d != %d/5" % [
+				int(dp[8]) if dp.size() > 8 else -1, int(dp[0]), expected_loss])
+	# R8: mutual monster KO is nonterminal with two independent return schedules.
+	var s6 := _baby_sim()
+	s6.pending_effects = [
+		_baby_damage_effect(6, 1, "monster", 0, 1, 20000),
+		_baby_damage_effect(7, 0, "monster", 1, 1, 20000),
+	]
+	s6._cut5_baby()
+	if bool(s6.actors[0]["alive"]) or bool(s6.actors[1]["alive"]):
+		bad.append("mutual KO did not down both monsters")
+	if s6.ended or not s6.ko_actors.is_empty():
+		bad.append("mutual KO fabricated a winner/end")
+	if int(s6.actors[0]["return_due"]) < 0 or int(s6.actors[1]["return_due"]) < 0:
+		bad.append("mutual KO did not schedule both returns")
+	_record("B12-mutual-ko-effects", bad.is_empty(),
+		"prior arrival settles once, down source survives, obsolete/incomplete identity rejected, mutual KO nonterminal; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_end() -> void:
+	var s := _baby_sim()
+	_mtick(s, 5399)
+	s.actors[0]["alive"] = false
+	s.actors[0]["lifecycle"] = "down"
+	s.actors[0]["hp"] = 0
+	s.actors[0]["life"] = 1
+	s.actors[0]["return_due"] = 5400
+	s.actors[0]["return_wait_announced"] = false
+	_pstep(s)
+	var bad: Array = []
+	if not s.ended or s.end_reason != 3 or s.terminal_category() != "baby_complete":
+		bad.append("5400 did not end with reason3")
+	if bool(s.actors[0]["alive"]):
+		bad.append("return/respawn occurred on the terminal boundary")
+	if int(s.summary().get("end_reason_id", -1)) != 3:
+		bad.append("summary end reason")
+	var s2 := _baby_sim()
+	_mtick(s2, 5399)
+	s2.aborted = true
+	_pstep(s2)
+	if not s2.ended or s2.end_reason != 4 or s2.terminal_category() != "aborted":
+		bad.append("abort did not win precedence")
+	_record("B13-end-precedence", bad.is_empty(),
+		"5400 ends before placements; requested abort wins same boundary; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_schema() -> void:
+	# R3: the bundle must actually contain a valid serialized IMPACT (cut3 hit) and a monster KO,
+	# plus a prey depletion. Build through the real production step with two due arrivals.
+	var s := _baby_sim()
+	_baby_freeze(s)
+	s.actors[1]["hp"] = 1
+	s.prey_slots[0]["hp"] = 2400
+	var e_mon := _baby_damage_effect(1, 0, "monster", 1, 1, 1800)
+	e_mon["impact_tick"] = 1
+	var e_prey := _baby_damage_effect(2, 0, "prey", 0, 1, 2400)
+	e_prey["impact_tick"] = 1
+	s.pending_effects = [e_mon, e_prey]
+	_pstep(s)
+	# S1: exercise the REAL blocked producers for both wait transitions (labeled synthetic
+	# radii at their actual due ticks), then roundtrip the serialized records.
+	s.actors[1]["radius"] = 6000.0
+	s.prey_slots[0]["radius"] = 6000.0
+	s.actors[1]["return_wait_announced"] = false
+	s.prey_slots[0]["spawn_wait_announced"] = false
+	_mtick(s, int(s.actors[1]["return_due"]))
+	s._process_due_lifecycles(0)
+	_mtick(s, int(s.prey_slots[0]["respawn_due"]))
+	s._process_due_lifecycles(0)
+	var lc_events := _events_with_tick(s, 27)
+	var has_return_wait := false
+	var has_spawn_wait := false
+	for ev in lc_events:
+		var trp: Array = (ev as Array)[1]
+		if str(trp[0]) == "return_wait":
+			has_return_wait = true
+		elif str(trp[0]) == "spawn_wait":
+			has_spawn_wait = true
+	s.telemetry.close_footer(s.summary(), true)
+	var res := s.telemetry.prepare_bundle()
+	var text := (s.telemetry.prepared_bytes as PackedByteArray).get_string_from_utf8()
+	var dec := M01Telemetry.decode_bundle(text)
+	var bad: Array = []
+	if not has_return_wait or not has_spawn_wait:
+		bad.append("real wait producers did not emit both transitions")
+	if not bool(dec["ok"]) or str((dec["header"] as Dictionary).get("schema", "")) != "m01.2":
+		bad.append("expanded bundle not decodable as m01.2: %s" % str(dec["errors"]))
+	var dmg: Array = _events_of_type(s, 12)
+	var prey_dmg := false
+	for ev in dmg:
+		var pay: Array = ev[3]
+		if pay.size() == 11 and str(pay[1]) == "2":
+			prey_dmg = true
+	if not prey_dmg:
+		bad.append("prey DAMAGE row lacks target life/credit fields")
+	if _events_of_type(s, 11).is_empty():
+		bad.append("valid serialized IMPACT row absent")
+	if _events_of_type(s, 19).is_empty():
+		bad.append("valid serialized monster KO row absent")
+	if _events_of_type(s, 28).is_empty() or (_events_of_type(s, 28)[0][3] as Array).size() != 12:
+		bad.append("HUNT_REWARD shape != 12 fields")
+	if _events_of_type(s, 27).is_empty() or (_events_of_type(s, 27)[0][3] as Array).size() != 7:
+		bad.append("BABY_LIFECYCLE shape != 7 fields")
+	var bad_text := text.replace("\"m01.2\"", "\"m01.9\"")
+	if bool(M01Telemetry.decode_bundle(bad_text)["ok"]):
+		bad.append("unknown schema version accepted")
+	# R3: every required malformed family must construct AND be rejected.
+	var lines := text.split("\n")
+	for mutant in [
+		["map", "arbitrary entity mapping accepted"],
+		["entity", "out-of-range target entity accepted"],
+		["transition_kind", "prey transition on a monster entity accepted"],
+		["wait_entity", "wait transition on the wrong entity class accepted"],
+		["null_gen", "valid hit with null generation accepted"],
+		["zero_gen", "zero generation accepted"],
+		["near_int", "near-integer identity accepted"],
+		["out_of_range", "out-of-range identity accepted"],
+		["gen", "fractional identity accepted"],
+		["transition", "unknown transition accepted"],
+		["type", "unknown event type accepted"],
+		["length", "wrong row length accepted"]]:
+		var mut := _mutate_expanded_bundle(lines, str(mutant[0]))
+		if mut == "":
+			bad.append("required mutant '%s' could not be constructed" % str(mutant[0]))
+		elif bool(M01Telemetry.decode_bundle(mut)["ok"]):
+			bad.append(str(mutant[1]))
+	var leg := _new_sim(3101, "live")
+	leg.telemetry.close_footer(leg.summary(), true)
+	leg.telemetry.prepare_bundle()
+	var ldec := M01Telemetry.decode_bundle((leg.telemetry.prepared_bytes as PackedByteArray).get_string_from_utf8())
+	if not bool(ldec["ok"]) or str((ldec["header"] as Dictionary).get("schema", "")) != "m01.1":
+		bad.append("legacy bundle changed")
+	# C07: canonical fingerprint distinguishes same-count queue/effect/route mutations.
+	var f := _baby_sim()
+	f.gateway.stage({"schema": "m01.1", "trainer": 0, "actor": 0, "sequence": 1, "slot": 0,
+		"family": 1, "target_kind": 0, "target_or_area": null, "observed_tick": 0}, 5, 1)
+	f.gateway.stage({"schema": "m01.1", "trainer": 1, "actor": 1, "sequence": 2, "slot": 1,
+		"family": 2, "target_kind": 0, "target_or_area": null, "observed_tick": 0}, 6, -1)
+	var h1 := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	var h_again := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	if h1 != h_again:
+		bad.append("repeated unchanged fingerprint differed")
+	f.gateway.staged[0]["family"] = 3
+	var h2 := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	if h1 == h2:
+		bad.append("same-count queue family mutation not fingerprinted")
+	f.gateway.staged[0]["family"] = 1
+	# S4: compare two LAWFUL known-area commands (target_kind 3) that differ only in hint.
+	f.gateway.staged[0]["target_kind"] = 3
+	f.gateway.staged[0]["target_or_area"] = [6000, 6000]
+	var hint_a: Dictionary = f.gateway.staged[0].duplicate(true)
+	var base_state := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	if base_state != M01Telemetry.canonical_state_sha256(f.canonical_state()):
+		bad.append("unchanged lawful hint-A fingerprint differed")
+	f.gateway.staged[0]["target_or_area"] = [7000, 6000]
+	var h2t := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	if base_state == h2t:
+		bad.append("same-count lawful area hint mutation not fingerprinted")
+	var hint_b: Dictionary = f.gateway.staged[0].duplicate(true)
+	if not f.gateway._valid_hint(3, hint_a["target_or_area"], f.actors[0], f.actors, f.tick) \
+			or not f.gateway._valid_hint(3, hint_b["target_or_area"], f.actors[0], f.actors, f.tick) \
+			or f.gateway.staged.size() != 2 \
+			or h2t != M01Telemetry.canonical_state_sha256(f.canonical_state()):
+		bad.append("lawful hint fixture/repeated fingerprint changed")
+	hint_b["target_or_area"] = hint_a["target_or_area"]
+	if hint_b != hint_a:
+		bad.append("lawful hint pair differed in another envelope field")
+	f.gateway.staged[0]["target_kind"] = 0
+	f.gateway.staged[0]["target_or_area"] = null
+	# Empty slot is an intentional negative envelope, with its own kind0/null baseline.
+	var empty_slot_base := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	f.gateway.staged[0]["slot"] = 7
+	var h2s := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	if empty_slot_base == h2s:
+		bad.append("same-count slot mutation not fingerprinted")
+	f.gateway.staged[0]["slot"] = 0
+	f.pending_effects = [_baby_damage_effect(1, 0, "prey", 0, 1, 500)]
+	var h3 := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	f.pending_effects[0]["base_power_cp"] = 900
+	var h4 := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	if h3 == h4:
+		bad.append("effect power mutation not fingerprinted")
+	f.prey_slots[0]["route"] = [[6000.0, 6000.0], [7000.0, 6000.0]]
+	var h5 := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	f.prey_slots[0]["route"] = [[6000.0, 6000.0], [7000.0, 6100.0]]
+	var h6 := M01Telemetry.canonical_state_sha256(f.canonical_state())
+	if h5 == h6:
+		bad.append("prey route mutation not fingerprinted")
+	_record("B14-telemetry-schema", bad.is_empty(),
+		"m01.2 strict decode/negatives, legacy m01.1, causal fingerprint mutations; problems=[%s]" % ", ".join(bad))
+
+
+## Builds a malformed expanded bundle variant from a valid one for one negative category.
+## An empty return means the required mutation could not be constructed (a case failure).
+func _mutate_expanded_bundle(lines: PackedStringArray, kind: String) -> String:
+	var out: Array = []
+	var mutated := false
+	for raw in lines:
+		var line := str(raw)
+		var parsed: Variant = JSON.parse_string(line)
+		if kind == "map" and not mutated and parsed is Dictionary \
+				and (parsed as Dictionary).has("entity_map"):
+			var hdr := (parsed as Dictionary).duplicate(true)
+			var em: Dictionary = hdr["entity_map"]
+			em["2"] = "preyX"
+			hdr["entity_map"] = em
+			out.append(JSON.stringify(hdr))
+			mutated = true
+			continue
+		if parsed is Array and (parsed as Array).size() == 4:
+			var ev := (parsed as Array).duplicate(true)
+			var type_id := int(ev[2])
+			if not mutated:
+				match kind:
+					"entity":
+						if type_id == 12:
+							(ev[3] as Array)[1] = 999
+							mutated = true
+					"transition_kind":
+						if type_id == 27 and str((ev[3] as Array)[0]) == "prey_depleted":
+							(ev[3] as Array)[1] = 0
+							mutated = true
+					"wait_entity":
+						if type_id == 27 and str((ev[3] as Array)[0]) == "return_wait":
+							(ev[3] as Array)[1] = 2
+							mutated = true
+					"null_gen":
+						if type_id == 11 and str((ev[3] as Array)[5]) == "hit":
+							(ev[3] as Array)[4] = null
+							mutated = true
+					"zero_gen":
+						if type_id == 19:
+							(ev[3] as Array)[1] = 0
+							mutated = true
+					"near_int":
+						if type_id == 12:
+							(ev[3] as Array)[9] = 1.0000000005
+							mutated = true
+					"out_of_range":
+						if type_id == 12:
+							(ev[3] as Array)[9] = 1.0e300
+							mutated = true
+					"gen":
+						if type_id == 12:
+							(ev[3] as Array)[9] = 1.5
+							mutated = true
+					"transition":
+						if type_id == 27:
+							(ev[3] as Array)[0] = "bogus_transition"
+							mutated = true
+					"length":
+						if type_id == 27:
+							(ev[3] as Array).pop_back()
+							mutated = true
+					"type":
+						ev[2] = 99
+						mutated = true
+			if mutated:
+				out.append(JSON.stringify(ev))
+				continue
+		out.append(line)
+	return "\n".join(out) if mutated else ""
+
+
+func _baby_case_projection() -> void:
+	var s := _baby_sim()
+	s.actors[0]["alive"] = false
+	s.actors[0]["lifecycle"] = "down"
+	s.actors[0]["return_due"] = s.tick + 300
+	var v := s.presentation_view_for_human()
+	var bad: Array = []
+	if str((v["own"] as Dictionary).get("status", "")) != "down":
+		bad.append("down status not exposed")
+	if int((v["enemy"] as Dictionary).get("knowledge", -1)) != 0 \
+			or (v["enemy"] as Dictionary).get("position", "x") != null:
+		bad.append("down observer exposed enemy sample")
+	if (v["prey"] as Array).size() != 0:
+		bad.append("down observer exposed prey")
+	if (v["nests"] as Array).size() != 2:
+		bad.append("nest layout missing")
+	if v.has("progression") or v.has("ledger"):
+		bad.append("growth numbers leaked to UI projection")
+	if str(v.get("terminal_category", "x")) != "":
+		bad.append("terminal category before end")
+	s.actors[0]["alive"] = true
+	s.actors[0]["x"] = 6000.0
+	s.actors[0]["y"] = 6000.0
+	s.prey_slots[0]["x"] = 6100.0
+	s.prey_slots[0]["y"] = 6000.0
+	s.prey_slots[1]["x"] = 19000.0
+	s.prey_slots[1]["y"] = 11000.0
+	var v2 := s.presentation_view_for_human()
+	if (v2["prey"] as Array).size() != 1:
+		bad.append("visible prey sample count %d != 1" % (v2["prey"] as Array).size())
+	elif not (v2["prey"] as Array).is_empty():
+		var sample: Dictionary = (v2["prey"] as Array)[0]
+		if sample.has("hp") or sample.has("credited"):
+			bad.append("prey numeric state leaked")
+	else:
+		bad.append("guarded sample indexing: missing prey sample reported")
+	_record("B15-safe-projection", bad.is_empty(),
+		"copied own status, hidden denial, visible-only prey, nests, no growth values, guarded indexing; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_case_categories() -> void:
+	var s := _baby_sim()
+	var a: Dictionary = s.actors[0]
+	var bad: Array = []
+	a["bound_active"] = true
+	a["bound_action"] = 7
+	a["onset_bound_action"] = -1
+	a["bound_purpose"] = 2
+	s._capture_onset(a, {"bound": true})
+	if str(s.onset_slots[0]) != "defensive_evasion":
+		bad.append("defensive Bound not DEF-category")
+	a["bound_action"] = 8
+	a["onset_bound_action"] = -1
+	a["bound_purpose"] = 3
+	s._capture_onset(a, {"bound": true})
+	if str(s.onset_slots[0]) != "escape":
+		bad.append("escape Bound not RUN-category")
+	a["bound_active"] = false
+	s.onset_slots = {0: "", 1: ""}
+	a["onset_prior_moving"] = false
+	a["onset_prior_category"] = ""
+	a["goal"] = {"kind": "move", "purpose": "disengage", "route": [[0, 0]], "point": [0, 0],
+		"stop_mwu": 0.0, "patrol_index": -1, "i": 0}
+	s._capture_onset(a, {"bound": false})
+	if str(s.onset_slots[0]) != "escape":
+		bad.append("ordinary retreat not RUN-category")
+	s.onset_slots = {0: "", 1: ""}
+	a["onset_prior_moving"] = false
+	a["onset_prior_category"] = ""
+	a["goal"] = {"kind": "move", "purpose": "approach", "route": [[0, 0]], "point": [0, 0],
+		"stop_mwu": 0.0, "patrol_index": -1, "i": 0}
+	s._capture_onset(a, {"bound": false})
+	if str(s.onset_slots[0]) != "other":
+		bad.append("approach produced a callout category")
+	# brace onset and quick release
+	_mtick(s, 10)
+	a["brace_start"] = 9
+	a["brace_end"] = 15
+	a["onset_prior_brace"] = false
+	s._publish_public_actions()
+	if str(s.onset_slots[0]) != "active_defense":
+		bad.append("active Brace onset missing")
+	s.onset_slots = {0: "", 1: ""}
+	s.quick_releases = []
+	a["x"] = 6000.0
+	a["y"] = 6000.0
+	s.actors[1]["x"] = 6400.0
+	s.actors[1]["y"] = 6000.0
+	s.actors[1]["alive"] = true
+	a["enemy_visible"] = true
+	a["action"] = {"action": 1, "actor": 0, "life": 1, "life_id": 1,
+		"target_ref": {"kind": "monster", "id": 1, "life_id": 1},
+		"target_life_id": 1, "request": 0, "episode": 0, "intent": -1, "owning_family": 1,
+		"skill": "quick_claw", "target": 1, "target_kind": 2, "start_tick": 0, "due_tick": 0,
+		"recovery_ticks": 21, "paid_cost": 600, "cooldown_end": 0, "stability": 1,
+		"interrupt_power": 1, "state": "due", "cancel_cause": "", "plan": {}}
+	s._cut4()
+	if s.quick_releases.is_empty() or int(s.quick_releases[0]["side"]) != 0:
+		bad.append("quick release not recorded for own side")
+	elif int(s.quick_releases[0].get("life_id", -1)) != 1:
+		bad.append("quick release did not carry the captured source life")
+	# C09: a release from a new life carries the new generation (so a stale-life mark cannot
+	# be inherited by the replacement).
+	s.quick_releases = []
+	a["life_id"] = 2
+	a["action"] = {"action": 2, "actor": 0, "life": 1, "life_id": 2,
+		"target_ref": {"kind": "monster", "id": 1, "life_id": 1},
+		"target_life_id": 1, "request": 0, "episode": 0, "intent": -1, "owning_family": 1,
+		"skill": "quick_claw", "target": 1, "target_kind": 2, "start_tick": 0, "due_tick": 0,
+		"recovery_ticks": 21, "paid_cost": 600, "cooldown_end": 0, "stability": 1,
+		"interrupt_power": 1, "state": "due", "cancel_cause": "", "plan": {}}
+	s._cut4()
+	if s.quick_releases.is_empty() or int(s.quick_releases[0].get("life_id", -1)) != 2:
+		bad.append("new-life quick release did not carry the new generation")
+	# R5/R6/R7: real producer-to-snapshot consumer ordering.
+	var pres := M01Presentation.new()
+	# Hidden enemy at tick5, then a lawful enemy release captured for tick6 BEFORE its snapshot.
+	pres.receive_public_snapshot(_baby_view(5, [6000, 6000], 1, "alive", "", 0, null, -1, ""))
+	pres.on_quick_release(1, 1, 6, 7000.0, 6000.0, 1)
+	pres.receive_public_snapshot(_baby_view(6, [6000, 6000], 1, "alive", "", 2, [7000, 6000], 1, "claw"))
+	if (pres.slash_slots.get(1, {}) as Dictionary).is_empty() \
+			or int((pres.slash_slots.get(1, {}) as Dictionary).get("tick", -1)) != 6:
+		bad.append("current lawful release was discarded by the first visible snapshot")
+	# S3: same-life KO at tick7 suppresses the visible-enemy transient even when the SAME
+	# snapshot also carries a performed onset captured before cut5.
+	pres.receive_public_snapshot(_baby_view(7, [6000, 6000], 1, "alive", "", 2, [7000, 6000], 1,
+		"ko", "", "defensive_evasion"))
+	if not (pres.slash_slots.get(1, {}) as Dictionary).is_empty() \
+			or not (pres.callouts.get(1, {}) as Dictionary).is_empty():
+		bad.append("same-life enemy KO did not dominate its conflicting onset")
+	# S3: own down + action ko + escape onset must also stay empty.
+	pres.on_quick_release(0, 1, 8, 6000.0, 6000.0, 1)
+	pres.receive_public_snapshot(_baby_view(8, [6000, 6000], 1, "down", "ko", 0, null, -1, "",
+		"escape", ""))
+	if not (pres.slash_slots.get(0, {}) as Dictionary).is_empty() \
+			or not (pres.callouts.get(0, {}) as Dictionary).is_empty():
+		bad.append("same-life own down did not dominate its conflicting onset")
+	# Living counterparts still receive their genuine onset text.
+	pres.receive_public_snapshot(_baby_view(9, [6000, 6000], 1, "alive", "", 2, [7000, 6000], 1,
+		"claw"))
+	if str((pres.callouts.get(0, {}) as Dictionary).get("text", "")) != "":
+		bad.append("stale own callout survived the living reset")
+	pres.receive_public_snapshot(_baby_view(10, [6000, 6000], 1, "alive", "", 2, [7000, 6000], 1,
+		"claw", "escape", "defensive_evasion"))
+	if str((pres.callouts.get(0, {}) as Dictionary).get("text", "")) != "RUN!" \
+			or str((pres.callouts.get(1, {}) as Dictionary).get("text", "")) != "DEF!":
+		bad.append("living counterparts did not receive genuine DEF/RUN onset text")
+	# R6/S4: pause invalidates movement baselines but preserves frozen slash/text age.
+	pres.on_quick_release(0, 1, 11, 6000.0, 6000.0, 1)
+	var born_before := float((pres.slash_slots.get(0, {}) as Dictionary).get("born", -1.0))
+	pres.receive_public_snapshot(_baby_view(11, [6000, 6000], 1, "alive", "", 0, null, -1, ""))
+	pres.receive_public_snapshot(_baby_view(12, [6050, 6000], 1, "alive", "", 0, null, -1, ""))
+	if not pres.own_moving:
+		bad.append("consecutive visible displacement did not register movement")
+	pres._on_host_state_changed(true, "manual")
+	if pres.own_moving or pres.own_prev_pos != null:
+		bad.append("pause did not invalidate the movement baseline")
+	if (pres.slash_slots.get(0, {}) as Dictionary).is_empty() \
+			or absf(float((pres.slash_slots.get(0, {}) as Dictionary).get("born", -1.0)) - born_before) > 1e-9:
+		bad.append("pause did not preserve the frozen slash age")
+	pres._on_host_state_changed(false, "resume")
+	pres.receive_public_snapshot(_baby_view(13, [6100, 6000], 1, "alive", "", 0, null, -1, ""))
+	if pres.own_moving:
+		bad.append("first resumed sample re-used a pre-pause baseline")
+	pres.receive_public_snapshot(_baby_view(14, [6150, 6000], 1, "alive", "", 0, null, -1, ""))
+	if not pres.own_moving:
+		bad.append("later resumed actual movement did not draw")
+	pres.free()
+	_record("B16-action-categories", bad.is_empty(),
+		"DEF/RUN/other onset mapping, life-bound Quick release, current-release retention, KO-dominated onsets, pause/restore baseline; problems=[%s]" % ", ".join(bad))
+
+
+func _baby_view(tv: int, own_pos: Array, own_life: int, own_status: String, own_action: String,
+		en_k: int, en_pos: Variant, en_life: int, en_action: String,
+		own_onset: String = "", en_onset: String = "") -> Dictionary:
+	var en := {"knowledge": en_k, "position": en_pos if en_k == 2 else null,
+		"life_id": en_life if en_k == 2 else null, "action": en_action if en_k == 2 else "",
+		"facing": 2, "performed_onset": en_onset if en_k == 2 else "",
+		"last_known_position": null, "hp_band": 4, "last_seen_tick": tv}
+	return {"tick": tv, "own": {"position": own_pos, "life_id": own_life,
+		"status": own_status, "action": own_action, "facing": 2,
+		"performed_onset": own_onset, "growth_tick": -1, "return_tick": -1}, "enemy": en,
+		"prey": [], "nests": [], "terminal_category": ""}
+
+
+func _baby_case_legacy() -> void:
+	var s := _new_sim(3101, "live")
+	var bad: Array = []
+	if s.is_expanded() or s.schema_name() != "m01.1":
+		bad.append("legacy mode/schema changed")
+	if int(s.actors[0]["x"]) != 4000 or int(s.actors[1]["x"]) != 16000:
+		bad.append("legacy base spawns changed")
+	if int(content.tuning["timeout_active_ticks"]) != 10800:
+		bad.append("legacy timeout changed")
+	# C12/QA-F06: a lawful due qualified arrival at its real settlement boundary drives an actual
+	# damage -> KO -> END chain through the production step (no direct _cut5 substitute).
+	_baby_freeze(s)
+	s.actors[1]["hp"] = 1
+	var eff := {"effect": 1, "action": 0, "source": 0, "target": 1, "kind": "damage",
+		"impact_tick": 1, "interrupt_power": 1, "qualification": "qualified", "batch": 0,
+		"base_power_cp": 1800, "source_atk": 100, "target_def": 25,
+		"brace_factor_bp": 10000, "phase_factor_bp": 10000}
+	s.pending_effects = [eff]
+	_pstep(s)
+	if not s.ended or s.end_reason != 1 or s.ko_actors != [1]:
+		bad.append("legacy damage->KO->END chain did not complete (ended=%s reason=%d ko=%s)" % [
+			str(s.ended), s.end_reason, str(s.ko_actors)])
+	if _events_with_tick(s, 19).is_empty():
+		bad.append("legacy KO row missing")
+	_record("B17-legacy-preservation", bad.is_empty(),
+		"2 actors, base spawns, 10800 timeout, m01.1, real first-KO endpoint; problems=[%s]" % ", ".join(bad))
+
+
 func _append_note(title: String, body: String) -> void:
 	print("%s: %s" % [title, body])
 
@@ -2570,8 +4055,9 @@ func _write_results(pass_n: int, fail_n: int, nr_n: int, wall: int) -> void:
 		body["profile"] = profile_name
 		body["seed"] = profile_seed
 		body["deadline"] = {
-			"wall_ms": PLAY01_FOCUS_WALL_MS if profile_name == "play01_focus" else DEV_SMOKE_WALL_MS,
-			"origin_ms": started_msec if profile_name == "play01_focus" else dev_smoke_t0,
+			"wall_ms": PLAY01_FOCUS_WALL_MS if profile_name == "play01_focus" \
+				else (DEV_SMOKE_WALL_MS if profile_name == "dev_smoke" else BABY_WALL_MS),
+			"origin_ms": started_msec,
 			"absolute_deadline_ms": dl,
 			"remaining_ms": (dl - Time.get_ticks_msec()) if dl > 0 else -1,
 			# RUN01 F04: positive remainder, not merely "not yet past". This is sampled before
@@ -2585,7 +4071,8 @@ func _write_results(pass_n: int, fail_n: int, nr_n: int, wall: int) -> void:
 			# RUN01 F06: dev_smoke reports its existing 120-call cap rather than a 0 ceiling,
 			# so the result can never claim no budget while real steps were taken.
 			"ceiling": (PLAY01_FOCUS_MAX_STEPS if focus_active
-				else (DEV_SMOKE_MAX_TICKS if profile_name == "dev_smoke" else 0)),
+				else (BABY_MAX_STEPS if baby_active
+				else (DEV_SMOKE_MAX_TICKS if profile_name == "dev_smoke" else 0))),
 			"per_case_max": case_steps_max,
 			"manual_tick_jumps": manual_ticks,
 		}

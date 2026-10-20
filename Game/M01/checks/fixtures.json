@@ -109,5 +109,24 @@
       "start": 648,
       "expect_failure": "invalid_predecessor"
     }
-  ]
+  ],
+  "baby_growth_revival": {
+    "id": "fixtures.m01.baby_growth_revival",
+    "seed": 3101,
+    "scope": "Opt-in expanded Baby profile only. seed3101, <=120 actual step calls under one absolute3000ms development deadline, stop on first failed/incomplete case, unreached NOT RUN. Product map and legacy profiles are unchanged.",
+    "mode": "baby_growth_revival",
+    "prey_slots": [[6000, 6000], [14000, 6000]],
+    "nest_centers": [[2000, 10000], [18000, 2000]],
+    "placement_candidates": 17,
+    "reward_schedule": [[2, 10], [1, 5]],
+    "predicates": {
+      "monster_return_ticks": 300,
+      "prey_respawn_ticks": 900,
+      "diagnostic_ticks": 5400
+    },
+    "notes": "Timer predicates are proven by labelled manual tick jumps, never by 5/15/90s real play.",
+    "qa_table_rows": 16,
+    "authored_cases": 17,
+    "correction": "MM-M01-BABY01-FIX01 R02: C01-C13 producer/consumer corrections; authored predicates unchanged in scope, none executed."
+  }
 }

@@ -70,6 +70,7 @@ func decide(tick: int, npc: Dictionary, actor: Dictionary, enemy: Dictionary,
 	return {
 		"decision": did,
 		"observation_tick": tick,
+		"source_life": int(actor.get("life_id", 1)),
 		"safety_category": category,
 		"proposed_slot": family,
 		"lawful_hint": [target_kind, target_or_area],

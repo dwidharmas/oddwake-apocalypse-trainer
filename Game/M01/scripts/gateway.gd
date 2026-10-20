@@ -16,11 +16,24 @@ func reset() -> void:
 	next_request_id = 1
 
 
-func stage(raw: Dictionary, effective_tick: int) -> void:
+func stage(raw: Dictionary, effective_tick: int, source_life: int = -1) -> void:
 	var copy := raw.duplicate(true)
 	copy["effective_tick"] = effective_tick
 	copy["staged_for"] = effective_tick
+	if source_life >= 0:
+		copy["source_life"] = source_life
 	staged.append(copy)
+
+
+## Drops un-admitted work from one actor's old life on KO/return. Sequences and streams are
+## NOT reset; the generation check in validate() remains authoritative.
+func purge_actor(actor: int) -> void:
+	var keep: Array = []
+	for raw in staged:
+		if int(raw.get("actor", -1)) == actor:
+			continue
+		keep.append(raw)
+	staged = keep
 
 
 func _is_finite_number(v: Variant) -> bool:
@@ -56,6 +69,10 @@ func validate(raw: Dictionary, tick: int, actors: Array, trainer_owner: Dictiona
 	if int(a["control_mode"]) != 0:
 		return {"ok": false, "reason": "control", "actor": actor, "request": int(raw.get("request_id", 0))}
 	if not bool(a["alive"]):
+		return {"ok": false, "reason": "life", "actor": actor}
+	if raw.has("source_life") and int(raw["source_life"]) >= 0 \
+			and int(a["life_id"]) != int(raw["source_life"]):
+		# Obsolete pre-KO generation: truthful life rejection, no waiting queue.
 		return {"ok": false, "reason": "life", "actor": actor}
 
 	var seq := int(raw["sequence"])

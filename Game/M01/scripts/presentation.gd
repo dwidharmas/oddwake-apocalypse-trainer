@@ -74,6 +74,28 @@ var loading_label: Label
 
 var forced_pose := {}
 var forced_pose_ticks := 0
+var public_view := {}
+var snapshot_tick := -1
+var snapshot_prev_tick := -1
+var own_prev_pos: Variant = null
+var own_cur_pos: Variant = null
+var enemy_prev_pos: Variant = null
+var enemy_cur_pos: Variant = null
+var snapshot_own_life := -1
+var snapshot_enemy_life := -1
+var own_moving := false
+var enemy_moving := false
+## C09: exactly one replaceable slash slot per side, keyed by captured source life.
+var slash_slots := {0: {}, 1: {}}
+var callouts := {0: {}, 1: {}}
+var active_ms := 0.0
+var result_card: PanelContainer = null
+var result_title: Label = null
+var result_body: Label = null
+var result_footer: Label = null
+var restart_home: Node = null
+var restart_home_index := -1
+var card_active := false
 var stale_enemy := {}
 var last_enemy_knowledge := -1
 var last_record_size := -1
@@ -132,6 +154,30 @@ func _on_host_state_changed(_paused: bool, reason: String) -> void:
 		pending_probes.clear()
 		latency_probe_request = 0
 		latency_probe_mono = 0
+		public_view = {}
+		snapshot_tick = -1
+		snapshot_prev_tick = -1
+		own_prev_pos = null
+		own_cur_pos = null
+		enemy_prev_pos = null
+		enemy_cur_pos = null
+		snapshot_own_life = -1
+		snapshot_enemy_life = -1
+		callouts = {0: {}, 1: {}}
+		slash_slots = {0: {}, 1: {}}
+		contact_marks.clear()
+		swipe_marks.clear()
+		stale_enemy.clear()
+		_hide_result_card()
+	else:
+		# R6: every pause/resume/lifecycle boundary invalidates motion baselines. Frozen
+		# slash/text ages and the guard are deliberately preserved.
+		own_moving = false
+		enemy_moving = false
+		own_prev_pos = null
+		own_cur_pos = null
+		enemy_prev_pos = null
+		enemy_cur_pos = null
 	hud_dirty = true
 
 
@@ -143,11 +189,201 @@ func _on_encounter_changed() -> void:
 	last_record_size = -1
 	last_record_head = ""
 	last_cue_text = ""
-	stale_enemy.clear()
-	last_enemy_knowledge = -1
-	contact_marks.clear()
-	swipe_marks.clear()
 	pending_probes.clear()
+	hud_dirty = true
+
+
+func _is_expanded() -> bool:
+	return host != null and host.sim != null and host.sim.is_expanded()
+
+
+func receive_public_snapshot(view: Dictionary) -> void:
+	var t := int(view.get("tick", -1))
+	if t <= snapshot_tick:
+		return
+	var prev_tick := snapshot_tick
+	var own: Dictionary = view.get("own", {})
+	var own_pos: Variant = own.get("position", null)
+	var en: Dictionary = view.get("enemy", {})
+	var en_pos: Variant = en.get("position", null)
+	public_view = view
+	snapshot_tick = t
+	# OWN baseline: previous/current pair retained through draw (C10); invalidated on a
+	# nonconsecutive tick, generation change, pause/end or reset.
+	var own_life := int(own.get("life_id", -1))
+	var own_status := str(own.get("status", "alive"))
+	var own_action := str(own.get("action", ""))
+	var own_ko := own_status == "down" or own_status == "waiting_return" or own_action == "ko"
+	var en_visible := int(en.get("knowledge", 0)) == 2
+	var en_life := int(en.get("life_id", -1)) if en_visible else -1
+	var en_action := str(en.get("action", "")) if en_visible else ""
+	var enemy_ko := en_visible and en_action == "ko"
+	var consecutive := prev_tick == t - 1
+	var own_prev: Variant = own_cur_pos
+	own_cur_pos = Vector2(float(own_pos[0]), float(own_pos[1])) if own_pos != null else null
+	own_moving = consecutive and own_prev != null and own_cur_pos != null \
+		and ((own_cur_pos as Vector2) - (own_prev as Vector2)).length() > 0.001
+	var en_prev: Variant = enemy_cur_pos
+	enemy_cur_pos = Vector2(float(en_pos[0]), float(en_pos[1])) \
+		if (en_visible and en_pos != null) else null
+	enemy_moving = consecutive and en_visible and en_prev != null and enemy_cur_pos != null \
+		and ((enemy_cur_pos as Vector2) - (en_prev as Vector2)).length() > 0.001
+	# R7: a lawful release captured DURING this step (signal before snapshot) survives baseline
+	# invalidation when its side/life/occurrence tick matches the permitted current state.
+	var keep_own_release := not own_ko and _slot_is_current(slash_slots.get(0, {}), own_life, t)
+	var keep_enemy_release := en_visible and not enemy_ko \
+		and _slot_is_current(slash_slots.get(1, {}), en_life, t)
+	# R5/R6: same-life KO/down invalidates transients; pause/resume handled by host event.
+	if not consecutive or own_life != snapshot_own_life or own_ko:
+		own_moving = false
+		own_prev = null
+		if not keep_own_release:
+			slash_slots[0] = {}
+			callouts[0] = {}
+	if not consecutive or not en_visible or en_life != snapshot_enemy_life or enemy_ko:
+		enemy_moving = false
+		en_prev = null
+		if not keep_enemy_release:
+			slash_slots[1] = {}
+			callouts[1] = {}
+	own_prev_pos = own_prev
+	enemy_prev_pos = en_prev
+	snapshot_own_life = own_life
+	snapshot_enemy_life = en_life
+	snapshot_prev_tick = prev_tick
+	# Performed onsets: only actual transitions captured by the producer. S3: KO/down/terminal
+	# suppression dominates acceptance, so a same-boundary onset captured before cut5 cannot
+	# recreate text for the down actor or a visibly KO'd enemy.
+	var terminal := str(view.get("terminal_category", "")) != ""
+	if not own_ko and not terminal:
+		var own_onset := str(own.get("performed_onset", ""))
+		if own_onset == "active_defense" or own_onset == "defensive_evasion":
+			_set_callout(0, "DEF!")
+		elif own_onset == "escape":
+			_set_callout(0, "RUN!")
+	if en_visible and not enemy_ko and not terminal:
+		var e_onset := str(en.get("performed_onset", ""))
+		if e_onset == "active_defense" or e_onset == "defensive_evasion":
+			_set_callout(1, "DEF!")
+		elif e_onset == "escape":
+			_set_callout(1, "RUN!")
+	if own_ko:
+		callouts[0] = {}
+		slash_slots[0] = {}
+	if enemy_ko:
+		callouts[1] = {}
+		slash_slots[1] = {}
+	if terminal:
+		callouts = {0: {}, 1: {}}
+		slash_slots = {0: {}, 1: {}}
+		own_moving = false
+		enemy_moving = false
+	var lk: Variant = en.get("last_known_position", null)
+	if int(en.get("knowledge", 0)) == 1 and lk != null:
+		stale_enemy = {"pos": Vector2(float(lk[0]), float(lk[1])), "action": "", "hp": -1, "tick": t}
+	else:
+		stale_enemy.clear()
+	hud_dirty = true
+	update()
+
+
+func _slot_is_current(slot: Variant, life_id: int, tick: int) -> bool:
+	if not (slot is Dictionary):
+		return false
+	var s := slot as Dictionary
+	if s.is_empty():
+		return false
+	return int(s.get("life_id", -1)) == life_id and int(s.get("tick", -1)) == tick
+
+
+func on_quick_release(side: int, life_id: int, tick: int, x: float, y: float, facing: int) -> void:
+	# One replaceable slash slot per side carrying the captured source life AND occurrence tick.
+	slash_slots[side] = {"pos": Vector2(x, y), "angle": float(facing) * PI / 2.0,
+		"born": active_ms, "life_id": life_id, "tick": tick, "side": side}
+	_set_callout(side, "ATK!", life_id, tick)
+	hud_dirty = true
+	update()
+
+
+func _set_callout(side: int, text: String, life_id: int = -1, tick: int = -1) -> void:
+	callouts[side] = {"text": text, "born": active_ms, "life_id": life_id, "tick": tick}
+
+
+func _age_callouts() -> void:
+	for side in [0, 1]:
+		var slot: Dictionary = callouts.get(side, {})
+		if slot.is_empty():
+			continue
+		if active_ms - float(slot.get("born", 0.0)) > 220.0:
+			callouts[side] = {}
+
+
+func _update_result_card() -> void:
+	if host == null or result_card == null:
+		return
+	var ended := bool(host.paused) and str(host.pause_reason) == "encounter_end"
+	var cat := str(public_view.get("terminal_category", ""))
+	if not ended or cat == "" or cat == "timeout":
+		if card_active:
+			_hide_result_card()
+		return
+	if card_active:
+		return
+	match cat:
+		"baby_complete":
+			_show_result_card("Baby playtest complete",
+				"The diagnostic playtest reached its scheduled end.", "Diagnostic sparring result")
+		"aborted":
+			_show_result_card("Playtest stopped", "No result.", "Diagnostic sparring result")
+		"own_down":
+			_show_result_card("Encounter ended", "Your Behemoth is down", "Diagnostic sparring result")
+		"enemy_down":
+			_show_result_card("Encounter ended", "NPC Behemoth is down", "Diagnostic sparring result")
+		"both_down":
+			_show_result_card("Encounter ended", "Both Behemoths are down", "Diagnostic sparring result")
+		_:
+			_show_result_card("Result unavailable",
+				"The encounter ended without a consistent result.", "Diagnostic sparring result")
+
+
+func _show_result_card(title: String, body: String, footer: String) -> void:
+	if result_card == null:
+		return
+	result_title.text = title
+	result_body.text = body
+	result_footer.text = footer
+	result_card.visible = true
+	card_active = true
+	if restart_button != null:
+		if restart_home == null:
+			restart_home = restart_button.get_parent()
+			restart_home_index = restart_button.get_index()
+		var holder := result_card.get_node_or_null("VBox")
+		if holder != null and restart_button.get_parent() != holder:
+			var old := restart_button.get_parent()
+			if old != null:
+				old.remove_child(restart_button)
+			holder.add_child(restart_button)
+		restart_button.text = "Play again"
+		restart_button.visible = true
+		restart_button.grab_focus()
+	hud_dirty = true
+
+
+func _hide_result_card() -> void:
+	if result_card == null:
+		return
+	result_card.visible = false
+	card_active = false
+	if restart_button != null:
+		if restart_home != null and restart_button.get_parent() != restart_home:
+			var old2 := restart_button.get_parent()
+			if old2 != null:
+				old2.remove_child(restart_button)
+			restart_home.add_child(restart_button)
+			restart_home.move_child(restart_button, clampi(restart_home_index, 0,
+				restart_home.get_child_count() - 1))
+		restart_button.text = "Restart"
 	hud_dirty = true
 
 
@@ -208,6 +444,10 @@ static func contrast_report() -> Dictionary:
 func _process(delta: float) -> void:
 	if host == null:
 		return
+	var running := bool(host.started) and not bool(host.paused)
+	if running:
+		active_ms += delta * 1000.0
+		_age_callouts()
 	# R-F04/QA-RES-F04: continuous HUD update and arena redraw only while the run is
 	# actually advancing. Paused, end and idle-ready states repaint only on a state
 	# change, so input/focus/cue/lifecycle feedback stays responsive without a
@@ -216,11 +456,11 @@ func _process(delta: float) -> void:
 	if vs != last_viewport_size:
 		last_viewport_size = vs
 		hud_dirty = true
-	var running := bool(host.started) and not bool(host.paused)
 	if not running and not hud_dirty:
 		return
 	if hud_root != null:
 		_update_hud(delta)
+		_update_result_card()
 	queue_redraw()
 	hud_dirty = false
 
@@ -269,12 +509,18 @@ func _draw() -> void:
 	draw_rect(Rect2(bpos, bsize), c("blocker"), true)
 	draw_rect(Rect2(bpos, bsize), c("edge"), false, 2.0)
 
-	_draw_owner_marks(org, s)
+	if not _is_expanded():
+		_draw_owner_marks(org, s)
 	_draw_stale_mark(org, s)
-	_draw_legal_footprints(org, s)
+	if _is_expanded():
+		_draw_nests(org, s)
+		_draw_prey(org, s)
+	else:
+		_draw_legal_footprints(org, s)
 	_draw_actor(org, s, 0)
 	_draw_enemy_actor(org, s)
 	_draw_marks(org, s)
+	_draw_callouts(org, s)
 
 
 func _draw_owner_marks(org: Vector2, s: float) -> void:
@@ -320,25 +566,130 @@ func _draw_legal_footprints(org: Vector2, s: float) -> void:
 
 
 func _draw_marks(org: Vector2, s: float) -> void:
-	var now := Time.get_ticks_msec()
-	swipe_marks = swipe_marks.filter(func(m): return now - int(m["born"]) < 220)
-	contact_marks = contact_marks.filter(func(m): return now - int(m["born"]) < 260)
-	for m in swipe_marks:
-		var age := clampf(float(now - int(m["born"])) / 220.0, 0.0, 1.0)
+	var now := active_ms
+	contact_marks = contact_marks.filter(func(m): return now - float(m["born"]) < 260.0)
+	# S3: down/KO suppression applies to text-only slots too (a movement onset has no slash).
+	var own_v0: Dictionary = public_view.get("own", {})
+	var own_down0 := str(own_v0.get("status", "")) in ["down", "waiting_return"] \
+		or str(own_v0.get("action", "")) == "ko"
+	var enemy_ko0 := str(public_view.get("enemy", {}).get("action", "")) == "ko" \
+		and int(public_view.get("enemy", {}).get("knowledge", 0)) == 2
+	if own_down0:
+		callouts[0] = {}
+		slash_slots[0] = {}
+	if enemy_ko0:
+		callouts[1] = {}
+		slash_slots[1] = {}
+	# C09/C11: one replaceable slash slot per side, keyed by captured source life; a hidden or
+	# dead-life release is suppressed. Reduced motion draws a fixed silhouette for the same
+	# bounded active lifetime (no reach/alpha animation).
+	for side in [0, 1]:
+		var m: Dictionary = slash_slots.get(side, {})
+		if m.is_empty():
+			continue
+		if now - float(m.get("born", 0.0)) >= 220.0:
+			slash_slots[side] = {}
+			continue
+		var cur_life := snapshot_own_life if side == 0 else snapshot_enemy_life
+		if int(m.get("life_id", -1)) != cur_life or cur_life < 0:
+			slash_slots[side] = {}
+			continue
+		if side == 1 and int(public_view.get("enemy", {}).get("knowledge", 0)) != 2:
+			slash_slots[side] = {}
+			continue
+		# R5: an actual same-life KO/down suppresses the transient immediately.
+		var own_v: Dictionary = public_view.get("own", {})
+		if side == 0 and (str(own_v.get("status", "")) in ["down", "waiting_return"] \
+				or str(own_v.get("action", "")) == "ko"):
+			slash_slots[side] = {}
+			callouts[side] = {}
+			continue
+		if side == 1 and str(public_view.get("enemy", {}).get("action", "")) == "ko":
+			slash_slots[side] = {}
+			callouts[side] = {}
+			continue
 		var p := org + (m["pos"] as Vector2) * s
-		var reach := 46.0 * (0.5 + 0.5 * age)
 		var ang := float(m["angle"])
 		var arc := PackedVector2Array()
-		for k in 7:
-			var t := ang - 0.7 + 1.4 * float(k) / 6.0
-			arc.append(p + Vector2(cos(t), sin(t)) * reach)
-		draw_polyline(arc, Color(c("bone"), 1.0 - age), 4.0)
+		if reduced_motion:
+			for k in 7:
+				var t2 := ang - 0.7 + 1.4 * float(k) / 6.0
+				arc.append(p + Vector2(cos(t2), sin(t2)) * 46.0)
+			draw_polyline(arc, c("bone"), 4.0)
+		else:
+			var age := clampf((now - float(m["born"])) / 220.0, 0.0, 1.0)
+			var reach := 46.0 * (0.5 + 0.5 * age)
+			for k in 7:
+				var t := ang - 0.7 + 1.4 * float(k) / 6.0
+				arc.append(p + Vector2(cos(t), sin(t)) * reach)
+			draw_polyline(arc, Color(c("bone"), 1.0 - age), 4.0)
 	for m in contact_marks:
-		var age := clampf(float(now - int(m["born"])) / 260.0, 0.0, 1.0)
-		var p := org + (m["pos"] as Vector2) * s
-		var r := 18.0 + 8.0 * age
-		draw_rect(Rect2(p - Vector2(r, r) * 0.5, Vector2(r, r)), Color(c("accent"), 1.0 - age),
+		var age2 := clampf((now - float(m["born"])) / 260.0, 0.0, 1.0)
+		var p2 := org + (m["pos"] as Vector2) * s
+		var r := 18.0 + 8.0 * age2
+		draw_rect(Rect2(p2 - Vector2(r, r) * 0.5, Vector2(r, r)), Color(c("accent"), 1.0 - age2),
 			false, 3.0)
+
+
+## Primitive prey silhouettes from the copied visible samples only. No hidden positions.
+func _draw_prey(org: Vector2, s: float) -> void:
+	for rec in (public_view.get("prey", []) as Array):
+		var p := org + Vector2(float(rec["x"]), float(rec["y"])) * s
+		var r := 250.0 * s
+		var body := c("bone")
+		var moving := bool(rec.get("moving", false))
+		draw_circle(p, maxf(r, 3.0), body)
+		draw_circle(p + Vector2(r * 0.9, -r * 0.2), maxf(r * 0.45, 2.0), body)
+		draw_arc(p, maxf(r, 3.0), 0.0, TAU, 20, c("edge"), 1.5)
+		var leg := r * 0.5 if moving else r * 0.35
+		draw_line(p + Vector2(-r * 0.35, r * 0.6), p + Vector2(-r * 0.35, r * 0.6 + leg),
+			c("edge"), 2.0)
+		draw_line(p + Vector2(r * 0.35, r * 0.6), p + Vector2(r * 0.35, r * 0.6 + leg),
+			c("edge"), 2.0)
+
+
+## Two reusable Nest bases with a non-color ownership shape, drawn from the copied layout.
+func _draw_nests(org: Vector2, s: float) -> void:
+	for n in (public_view.get("nests", []) as Array):
+		var p := org + Vector2(float(n["x"]), float(n["y"])) * s
+		var rad := float(n["radius"]) * s
+		draw_arc(p, maxf(rad, 4.0), 0.0, TAU, 36, c("edge"), 2.0)
+		var col := c("bone") if int(n["side"]) == 0 else c("accent")
+		if int(n["side"]) == 0:
+			draw_colored_polygon(PackedVector2Array([p + Vector2(0, -10), p + Vector2(-9, 6),
+				p + Vector2(9, 6)]), col)
+		else:
+			draw_rect(Rect2(p + Vector2(-8, -8), Vector2(16, 16)), col, false, 3.0)
+
+
+## Two replaceable actor-relative text slots, aged by active unpaused presentation time.
+func _draw_callouts(org: Vector2, s: float) -> void:
+	var font := ThemeDB.fallback_font
+	for side in [0, 1]:
+		var slot: Dictionary = callouts.get(side, {})
+		if slot.is_empty():
+			continue
+		var p: Variant = null
+		if side == 0:
+			p = public_view.get("own", {}).get("position", null)
+		else:
+			if int(public_view.get("enemy", {}).get("knowledge", 0)) != 2:
+				continue
+			p = public_view.get("enemy", {}).get("position", null)
+		if p == null:
+			continue
+		var sp := org + Vector2(float(p[0]), float(p[1])) * s
+		var text := str(slot.get("text", ""))
+		if text == "":
+			continue
+		var size := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, 16)
+		var pos := sp + Vector2(24.0, -58.0)
+		var view := get_viewport_rect().size
+		pos.x = clampf(pos.x, 4.0, maxf(4.0, view.x - size.x - 8.0))
+		pos.y = clampf(pos.y, 20.0, maxf(20.0, view.y - 8.0))
+		draw_rect(Rect2(pos + Vector2(-3, -15), size + Vector2(6, 6)), c("backing"), true)
+		draw_rect(Rect2(pos + Vector2(-3, -15), size + Vector2(6, 6)), c("edge"), false, 1.0)
+		draw_string(font, pos, text, HORIZONTAL_ALIGNMENT_LEFT, -1, 16, c("bone"))
 
 
 func _pose_for(i: int) -> String:
@@ -381,10 +732,59 @@ func _pose_for(i: int) -> String:
 func _draw_actor(org: Vector2, s: float, i: int) -> void:
 	var a: Dictionary = host.sim.actors[i]
 	var pos := Vector2(float(a["x"]), float(a["y"]))
+	if _is_expanded() and i == 0:
+		var own: Dictionary = public_view.get("own", {})
+		var op: Variant = own.get("position", null)
+		if op != null:
+			pos = Vector2(float(op[0]), float(op[1]))
+		if own_moving and own_prev_pos != null:
+			_draw_strokes(org, s, pos, own_prev_pos)
+		_draw_puppet(org + pos * s, int(own.get("facing", 0)), _pose_for(0), s, 0)
+		if str(own.get("action", "")) == "bracing":
+			_draw_guard(org + pos * s, s)
+		return
 	_draw_puppet(org + pos * s, int(a["facing"]), _pose_for(i), s, i)
 
 
+## Two short paper motion strokes behind measured displacement; none when stationary.
+## C11: reduced motion suppresses movement strokes entirely.
+func _draw_strokes(org: Vector2, s: float, cur: Vector2, prev: Vector2) -> void:
+	if reduced_motion:
+		return
+	var d := cur - prev
+	if d.length() < 0.001:
+		return
+	var dir := d.normalized()
+	var side := Vector2(-dir.y, dir.x)
+	var base := org + prev * s
+	for k in 2:
+		var off := base - dir * (10.0 + 8.0 * k) + side * (6.0 if k == 0 else -6.0)
+		draw_line(off - side * 6.0, off + side * 6.0, c("muted"), 2.0)
+
+
+## Static open angular guard bracket, no filled shield.
+func _draw_guard(sp: Vector2, s: float) -> void:
+	var r := 40.0 + 10.0 * s
+	draw_line(sp + Vector2(-r, -r * 0.5), sp + Vector2(-r, r * 0.6), c("bone"), 3.0)
+	draw_line(sp + Vector2(r, -r * 0.5), sp + Vector2(r, r * 0.6), c("bone"), 3.0)
+
+
 func _draw_enemy_actor(org: Vector2, s: float) -> void:
+	if _is_expanded():
+		var e: Dictionary = public_view.get("enemy", {})
+		if int(e.get("knowledge", 0)) != 2:
+			return
+		var posv: Variant = e.get("position", null)
+		if posv == null:
+			return
+		var ep2 := Vector2(float(posv[0]), float(posv[1]))
+		if enemy_moving and enemy_prev_pos != null:
+			_draw_strokes(org, s, ep2, enemy_prev_pos)
+		var pp := _pose_enemy(str(e.get("action", "")))
+		_draw_puppet(org + ep2 * s, 2, pp, s, 1, false)
+		if str(e.get("action", "")) == "bracing":
+			_draw_guard(org + ep2 * s, s)
+		return
 	var obs: Dictionary = host.sim.observe_for(0)
 	var cues: Dictionary = obs["enemy"]
 	var k := int(cues.get("knowledge", 0))
@@ -616,12 +1016,34 @@ func _update_lifecycle_labels() -> void:
 		loading_label.add_theme_color_override("font_color", c("accent"))
 		return
 	if host.paused and str(host.pause_reason) == "encounter_end":
-		loading_label.text = "Diagnostic encounter complete. Restart to run another."
+		loading_label.text = "Diagnostic playtest ended." if _is_expanded() \
+			else "Diagnostic encounter complete. Restart to run another."
 		loading_label.add_theme_color_override("font_color", c("accent"))
 		return
 	if host.paused:
 		loading_label.text = "Send requests; your monster decides how to act"
 		loading_label.add_theme_color_override("font_color", c("muted"))
+		return
+	if _is_expanded() and not public_view.is_empty():
+		var own: Dictionary = public_view.get("own", {})
+		var st := str(own.get("status", "alive"))
+		var now_t := int(public_view.get("tick", -1))
+		var msg := "Send requests; your monster decides how to act"
+		var col := c("muted")
+		if st == "down":
+			msg = "Your monster is down — returning to your Nest"
+			col = c("danger")
+		elif st == "waiting_return":
+			msg = "Waiting for a clear return point"
+			col = c("danger")
+		elif int(own.get("return_tick", -1)) >= 0 and now_t - int(own["return_tick"]) <= 13:
+			msg = "Returned to Nest"
+			col = c("accent")
+		elif int(own.get("growth_tick", -1)) >= 0 and now_t - int(own["growth_tick"]) <= 13:
+			msg = "Hunt growth gained"
+			col = c("accent")
+		loading_label.text = msg
+		loading_label.add_theme_color_override("font_color", col)
 		return
 	loading_label.text = "Send requests; your monster decides how to act"
 	loading_label.add_theme_color_override("font_color", c("muted"))
@@ -678,19 +1100,32 @@ func _action_text(action: String) -> String:
 
 
 func _update_enemy_state() -> void:
-	var obs: Dictionary = host.sim.observe_for(0)
-	var cues: Dictionary = obs["enemy"]
 	enemy_label.add_theme_font_size_override("font_size", _base_size())
 	enemy_label.add_theme_color_override("font_color", c("bone"))
-	var k := int(cues.get("knowledge", 0))
+	var k := 0
+	var arch := ""
+	var last_seen := -1
+	var hp_band := -1
+	if _is_expanded() and not public_view.is_empty():
+		var e: Dictionary = public_view.get("enemy", {})
+		k = int(e.get("knowledge", 0))
+		arch = str(e.get("action", ""))
+		last_seen = int(e.get("last_seen_tick", -1))
+		hp_band = int(e.get("hp_band", -1))
+	else:
+		var obs: Dictionary = host.sim.observe_for(0)
+		var cues: Dictionary = obs["enemy"]
+		k = int(cues.get("knowledge", 0))
+		arch = str(cues.get("action_archetype", ""))
+		last_seen = int(cues.get("last_seen_tick", -1))
+		hp_band = int(cues.get("hp_band", -1))
 	var text := ""
 	if k == 2:
-		var arch := str(cues.get("action_archetype", ""))
 		text = "NPC: Visible · %s · %s" % [
-			M01Observations.hp_label(int(cues.get("hp_band", 4))),
+			M01Observations.hp_label(hp_band if hp_band >= 0 else 4),
 			_action_text(arch) if arch != "" else "observing"]
 	elif k == 1:
-		text = "NPC: Last Known · stale (froze at tick %d)" % int(cues.get("last_seen_tick", -1))
+		text = "NPC: Last Known · stale (froze at tick %d)" % last_seen
 	else:
 		text = "NPC: Unknown"
 	enemy_label.text = text
@@ -1102,6 +1537,48 @@ func _build_hud() -> void:
 	status_label.add_theme_font_size_override("font_size", font_size)
 	status_label.add_theme_color_override("font_color", COL_MUTED)
 	bottom.add_child(status_label)
+
+	# Result card: hidden until a genuine terminal lifecycle. Reuses the existing connected
+	# Restart instance as Play again (reparented on entry, restored on reset).
+	result_card = PanelContainer.new()
+	result_card.name = "ResultCard"
+	result_card.visible = false
+	result_card.set_anchors_preset(Control.PRESET_CENTER)
+	result_card.custom_minimum_size = Vector2(400, 0)
+	result_card.mouse_filter = Control.MOUSE_FILTER_STOP
+	var card_style := StyleBoxFlat.new()
+	card_style.bg_color = COL_BACKING
+	card_style.border_color = COL_EDGE
+	card_style.set_border_width_all(2)
+	card_style.content_margin_left = 16
+	card_style.content_margin_right = 16
+	card_style.content_margin_top = 16
+	card_style.content_margin_bottom = 16
+	result_card.add_theme_stylebox_override("panel", card_style)
+	var card_vbox := VBoxContainer.new()
+	card_vbox.name = "VBox"
+	card_vbox.add_theme_constant_override("separation", 8)
+	result_card.add_child(card_vbox)
+	result_title = Label.new()
+	result_title.name = "ResultTitle"
+	result_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	result_title.add_theme_font_size_override("font_size", 20)
+	result_title.add_theme_color_override("font_color", COL_BONE)
+	card_vbox.add_child(result_title)
+	result_body = Label.new()
+	result_body.name = "ResultBody"
+	result_body.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	result_body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	result_body.add_theme_font_size_override("font_size", font_size)
+	result_body.add_theme_color_override("font_color", COL_BONE)
+	card_vbox.add_child(result_body)
+	result_footer = Label.new()
+	result_footer.name = "ResultFooter"
+	result_footer.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	result_footer.add_theme_font_size_override("font_size", font_size)
+	result_footer.add_theme_color_override("font_color", COL_MUTED)
+	card_vbox.add_child(result_footer)
+	hud_root.add_child(result_card)
 
 	loading_label = Label.new()
 	loading_label.name = "Loading"

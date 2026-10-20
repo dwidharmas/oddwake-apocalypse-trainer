@@ -88,6 +88,110 @@ func center_legal(x: float, y: float) -> bool:
 	return in_inset(x, y) and not in_inflated_blocker(x, y)
 
 
+## Expanded-Baby radius-aware static legality. Derived from the SAME world rectangle and
+## ORIGINAL blocker; the legacy monster-radius predicate above is untouched.
+func static_legal_for(x: float, y: float, radius: float) -> bool:
+	if x - radius < GUARD or x + radius > width - GUARD:
+		return false
+	if y - radius < GUARD or y + radius > height - GUARD:
+		return false
+	var b := original_blocker()
+	if x + radius > float(b[0]) + GUARD and x - radius < float(b[1]) - GUARD \
+			and y + radius > float(b[2]) + GUARD and y - radius < float(b[3]) - GUARD:
+		return false
+	return true
+
+
+## Radius-aware swept static limit for one leg: the largest fraction of [from,to] whose centre
+## stays statically legal at `radius`. Mirrors swept_static_limit's contract.
+func swept_static_limit_for(from: Array, to: Array, radius: float) -> float:
+	var fx := float(from[0])
+	var fy := float(from[1])
+	var tx := float(to[0])
+	var ty := float(to[1])
+	if not static_legal_for(fx, fy, radius):
+		return 0.0
+	var dx := tx - fx
+	var dy := ty - fy
+	if dx * dx + dy * dy < 1e-18:
+		return 1.0
+	var rect := _slab(fx, fy, dx, dy, radius + GUARD, width - radius - GUARD,
+		radius + GUARD, height - radius - GUARD)
+	if float(rect[0]) < 0.0:
+		return 0.0
+	var lo := maxf(0.0, float(rect[0]))
+	var hi := minf(1.0, float(rect[1]))
+	if lo > hi:
+		return 0.0
+	var b := original_blocker()
+	var blk := _slab(fx, fy, dx, dy, float(b[0]) - radius - GUARD,
+		float(b[1]) + radius + GUARD, float(b[2]) - radius - GUARD,
+		float(b[3]) + radius + GUARD)
+	var t := hi
+	if float(blk[0]) >= 0.0 and float(blk[1]) >= 0.0:
+		var blo := float(blk[0])
+		var bhi := float(blk[1])
+		if blo <= hi and bhi >= lo:
+			if blo > lo:
+				t = minf(t, blo)
+			elif bhi < hi:
+				lo = bhi
+			else:
+				return 0.0
+	var rx := fx + dx * t
+	var ry := fy + dy * t
+	if static_legal_for(rx, ry, radius):
+		return t
+	var a := 0.0
+	var bnd := t
+	for i in 60:
+		var m := (a + bnd) * 0.5
+		if static_legal_for(fx + dx * m, fy + dy * m, radius):
+			a = m
+		else:
+			bnd = m
+	return a
+
+
+## Radius-aware sampled clear-line test, used for prey route connectors on the conservative
+## monster-radius navigation grid.
+func circle_line_clear_for(from: Array, to: Array, radius: float) -> bool:
+	var dx := float(to[0]) - float(from[0])
+	var dy := float(to[1]) - float(from[1])
+	var steps := maxi(1, int(ceil(sqrt(dx * dx + dy * dy) / 100.0)))
+	for i in steps + 1:
+		var t := float(i) / float(steps)
+		if not static_legal_for(float(from[0]) + dx * t, float(from[1]) + dy * t, radius):
+			return false
+	return true
+
+
+## Fixed 17-candidate placement order: preferred centre, then east, southeast, south,
+## southwest, west, northwest, north, northeast on the first ring, then the same eight on the
+## second. Diagonal components are radius/sqrt(2) from one ordered definition.
+func placement_candidates(center: Array, ring_radii: Array) -> Array:
+	var cx := float(center[0])
+	var cy := float(center[1])
+	var out: Array = [[cx, cy]]
+	var dirs: Array = [[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [-1.0, 1.0],
+		[-1.0, 0.0], [-1.0, -1.0], [0.0, -1.0], [1.0, -1.0]]
+	for ring in ring_radii:
+		var r := float(ring)
+		for d in dirs:
+			var dx := float(d[0])
+			var dy := float(d[1])
+			var ox := 0.0
+			var oy := 0.0
+			if dx != 0.0 and dy != 0.0:
+				ox = dx * r / sqrt(2.0)
+				oy = dy * r / sqrt(2.0)
+			else:
+				ox = dx * r
+				oy = dy * r
+			out.append([cx + ox, cy + oy])
+	return out
+
+
 func node_id(col: int, row: int) -> int:
 	return row * cols + col
 
@@ -467,6 +571,41 @@ static func earliest_contact(a0: Array, a1: Array, b0: Array, b1: Array, dist: f
 	if hi >= 0.0 and hi <= 1.0:
 		return 1.0
 	return 1.0
+
+
+## Earliest contact with per-body STOP fractions: a body with stop < 1 holds its position from
+## that fraction onward for the rest of the boundary. Used only by the expanded four-body sweep.
+static func earliest_contact_polyline_stopped(pa: Array, aa: Array, ai: float, sa: float,
+		pb: Array, ab: Array, bi: float, sb: float, dist: float) -> Array:
+	var a_move := ai > 1e-12 and sa > 1e-12
+	var b_move := bi > 1e-12 and sb > 1e-12
+	if not a_move and not b_move:
+		return [1.0, false]
+	var times: Array = [0.0, 1.0]
+	if a_move:
+		_append_break_times(times, aa, ai)
+	if b_move:
+		_append_break_times(times, ab, bi)
+	times.append(clampf(sa, 0.0, 1.0))
+	times.append(clampf(sb, 0.0, 1.0))
+	times.sort()
+	var uniq: Array = []
+	for t in times:
+		var tf := clampf(float(t), 0.0, 1.0)
+		if uniq.is_empty() or absf(float(uniq[uniq.size() - 1]) - tf) > 1e-12:
+			uniq.append(tf)
+	var d2 := dist * dist
+	for k in range(1, uniq.size()):
+		var t0 := float(uniq[k - 1])
+		var t1 := float(uniq[k])
+		var a0 := poly_point(pa, aa, ai, minf(t0, sa))
+		var a1 := poly_point(pa, aa, ai, minf(t1, sa))
+		var b0 := poly_point(pb, ab, bi, minf(t0, sb))
+		var b1 := poly_point(pb, ab, bi, minf(t1, sb))
+		var hit := _contact_local(a0, a1, b0, b1, d2)
+		if hit >= 0.0:
+			return [t0 + hit * (t1 - t0), true]
+	return [1.0, false]
 
 
 ## Cumulative arc distance at every vertex of a proposed trajectory, measured from its first

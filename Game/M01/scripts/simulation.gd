@@ -1,7 +1,12 @@
 class_name M01Simulation
 extends RefCounted
 
+## Presentation-only synchronous Quick release occurrence. Carries copied side + source life only.
+signal public_quick_release(side: int, life_id: int, tick: int, x: float, y: float, facing: int)
+
 const SCHEMA := "m01.1"
+const SCHEMA_EXPANDED := "m01.2"
+const MODE_BABY := "baby_growth_revival"
 const FAMILY_LABEL := {1: "Attack", 2: "Defense", 3: "Run"}
 const RESPONSE_CLASS := {1: "ignored", 2: "misinterpreted", 3: "declined",
 	4: "understood_hesitant", 5: "understood_normal", 6: "understood_strong"}
@@ -12,6 +17,12 @@ const REST_IDLE_TICKS := 60
 ## charge_elapsed / charge_total < 0.25 + 0.50 * (INT / 100). Equality declines.
 const CHARGE_CANCEL_BASE := 0.25
 const CHARGE_CANCEL_INT_WEIGHT := 0.50
+## Expanded Baby lifecycle bounds (Architect §4/§5). These are work ceilings, not measurements.
+const BABY_MAX_BODIES := 4
+const BABY_MAX_PAIRS := 6
+const BABY_MAX_PASSES := 4
+const BABY_MAX_PAIR_TESTS := 24
+const BABY_PLACEMENT_CANDIDATES := 17
 
 var content: M01Content
 var arena: M01Arena
@@ -32,6 +43,20 @@ var ko_actors: Array = []
 var aborted := false
 
 var actors: Array = []
+## Expanded Baby: fixed two-slot prey pool, per-side progression ledger, bounded private
+## presentation scratch. All empty in legacy modes.
+var prey_slots: Array = []
+var progression := {}
+var quick_releases: Array = []
+var onset_slots := {}
+var lifecycle_notices: Array = []
+var lifecycle_announced := {}
+var pair_test_total := 0
+var placement_test_total := 0
+var prey_expansion_total := 0
+var prey_search_total := 0
+var prey_violation_total := 0
+var movement_contract_failures := 0
 var trainer_owner := {0: 0, 1: 1}
 var human_feedback: Array = []
 var public_actions := {0: "", 1: ""}
@@ -78,8 +103,13 @@ func setup(p_content: M01Content, p_arena: M01Arena, p_telemetry: M01Telemetry,
 	fixture = p_fixture
 	fixture_id = str(p_fixture.get("id", ""))
 	behavior.setup(arena, content)
+	if p_mode == MODE_BABY and content.baby_section().is_empty():
+		push_error("M01 expanded mode requires the baby_growth_revival content section")
+		return false
 	_init_streams()
 	_init_actors()
+	if mode == MODE_BABY:
+		_init_baby_state()
 	return true
 
 
@@ -135,7 +165,7 @@ func _u(stream_name: String, force_key: String = "") -> float:
 
 func _make_actor(idx: int) -> Dictionary:
 	var sp: Dictionary = content.species
-	var spawn: Array = arena.spawn[idx]
+	var spawn: Array = _spawn_for(idx)
 	var labels := ["Attack", "Defense", "Run", "Empty", "Empty", "Empty", "Empty", "Empty"]
 	var skill_ids := ["quick_claw", "brace", "short_bound", "", "", "", "", ""]
 	var learned := {}
@@ -164,6 +194,21 @@ func _make_actor(idx: int) -> Dictionary:
 		"facing": 0,
 		"alive": true,
 		"life": 0,
+		"lifecycle": "alive",
+		"return_due": -1,
+		"return_wait_announced": false,
+		"returned_this_boundary": false,
+		"selected_target": {},
+		# Bounded observer knowledge: competitor compatibility view above plus two prey entries.
+		"prey_knowledge": [],
+		# Private presentation scratch (never serialized in canonical_state).
+		"bound_purpose": -1,
+		"onset_bound_action": -1,
+		"onset_prior_moving": false,
+		"onset_prior_category": "",
+		"onset_prior_brace": false,
+		"return_notice_tick": -1,
+		"growth_notice_tick": -1,
 		"emotion": "Calm",
 		"control_mode": 0,
 		"lock_end": 0,
@@ -246,6 +291,51 @@ func _init_actors() -> void:
 		_refresh_gates(a)
 
 
+func _spawn_for(idx: int) -> Array:
+	if mode == MODE_BABY:
+		# No silent legacy-spawn fallback in expanded mode: the section is required content.
+		var sec := content.baby_section()
+		return (sec["nests"]["centers"] as Array)[idx]
+	return arena.spawn[idx]
+
+
+func _init_baby_state() -> void:
+	var sec := content.baby_section()
+	var p: Dictionary = sec["prey"]
+	var hp := int(p["hp_max_cp"])
+	prey_slots = []
+	for s in 2:
+		var c: Array = (p["centers"] as Array)[s]
+		prey_slots.append({
+			"slot": s, "life_id": 1, "live": true, "hp": hp, "hp_max": hp,
+			"x": float(c[0]), "y": float(c[1]), "facing": 0,
+			"radius": float(p["radius_mwu"]),
+			"route": [], "route_i": 0, "next_plan_tick": 0,
+			"respawn_due": -1, "spawn_wait_announced": false,
+			"credited": [0, 0], "first_credit": [-1, -1],
+			"moved_this_boundary": false, "threat": -1,
+			"threat_x": 0.0, "threat_y": 0.0,
+		})
+	progression = {}
+	for i in 2:
+		progression[i] = {"pending_atk": 0, "evolution_exp": 0, "credited_defeats": 0}
+		actors[i]["prey_knowledge"] = [_new_knowledge(0), _new_knowledge(1)]
+	onset_slots = {0: "", 1: ""}
+	lifecycle_notices = []
+	lifecycle_announced = {}
+	quick_releases = []
+	pair_test_total = 0
+	placement_test_total = 0
+	prey_expansion_total = 0
+	movement_contract_failures = 0
+
+
+func _new_knowledge(slot: int) -> Dictionary:
+	return {"kind": "prey", "id": slot, "life_id": -1, "visible": false,
+		"x": 0.0, "y": 0.0, "last_seen_tick": -1, "expiry": 0,
+		"memory_valid": false, "token": 0, "visited": []}
+
+
 func apply_fixture(f: Dictionary) -> void:
 	fixture = f
 	fixture_id = str(f.get("id", fixture_id))
@@ -259,6 +349,22 @@ func apply_fixture(f: Dictionary) -> void:
 		var patch: Dictionary = st[idx_str]
 		for k in patch:
 			actors[idx][k] = patch[k]
+	if f.has("prey_state"):
+		var ps: Dictionary = f["prey_state"]
+		for slot_str in ps:
+			var slot := int(slot_str)
+			if slot < 0 or slot >= prey_slots.size():
+				continue
+			for k in (ps[slot_str] as Dictionary):
+				prey_slots[slot][k] = (ps[slot_str] as Dictionary)[k]
+	if f.has("progression"):
+		var pr: Dictionary = f["progression"]
+		for side_str in pr:
+			var side := int(side_str)
+			if side < 0 or side > 1:
+				continue
+			for k in (pr[side_str] as Dictionary):
+				progression[side][k] = (pr[side_str] as Dictionary)[k]
 	var locks: Array = f.get("control_locks", [])
 	for l in locks:
 		fixture["lock_schedule"] = locks
@@ -267,6 +373,79 @@ func apply_fixture(f: Dictionary) -> void:
 			pending_effects.append(e.duplicate(true))
 	_refresh_gates(actors[0])
 	_refresh_gates(actors[1])
+
+
+func _is_baby() -> bool:
+	return mode == MODE_BABY and not content.baby_section().is_empty()
+
+
+func is_expanded() -> bool:
+	return _is_baby()
+
+
+func _baby() -> Dictionary:
+	return content.baby_section()
+
+
+func _baby_ticks(key: String) -> int:
+	return int(content.compiled.get(key, 0))
+
+
+func _entity_life(kind: String, id: int) -> int:
+	if kind == "prey":
+		if id < 0 or id >= prey_slots.size():
+			return -1
+		return int(prey_slots[id]["life_id"])
+	if id < 0 or id > 1:
+		return -1
+	return int(actors[id]["life_id"])
+
+
+func _entity_live(kind: String, id: int) -> bool:
+	if kind == "prey":
+		if id < 0 or id >= prey_slots.size():
+			return false
+		return bool(prey_slots[id]["live"])
+	if id < 0 or id > 1:
+		return false
+	return bool(actors[id]["alive"])
+
+
+func _entity_pos(kind: String, id: int) -> Array:
+	if kind == "prey":
+		return [float(prey_slots[id]["x"]), float(prey_slots[id]["y"])]
+	return [float(actors[id]["x"]), float(actors[id]["y"])]
+
+
+func _entity_radius(kind: String, id: int) -> float:
+	if kind == "prey":
+		return float(prey_slots[id]["radius"])
+	return float(actors[id]["radius"])
+
+
+func _make_ref(kind: String, id: int, life_id: int) -> Dictionary:
+	return {"kind": kind, "id": id, "life_id": life_id}
+
+
+## Validates kind/id/generation/live state. An old reference never reads a replacement life.
+func _resolve_ref(ref: Variant) -> Dictionary:
+	if not (ref is Dictionary):
+		return {}
+	var r := ref as Dictionary
+	var kind := str(r.get("kind", ""))
+	var id := int(r.get("id", -1))
+	var life_id := int(r.get("life_id", -1))
+	if kind != "monster" and kind != "prey":
+		return {}
+	if not _entity_live(kind, id):
+		return {}
+	if _entity_life(kind, id) != life_id:
+		return {}
+	return {"kind": kind, "id": id, "life_id": life_id}
+
+
+func _entity_id_encoded(kind: String, id: int) -> int:
+	return id if kind == "monster" else 2 + id
 
 
 func _refresh_gates(a: Dictionary) -> void:
@@ -292,6 +471,8 @@ func _tick_start() -> void:
 	cancelled_this_boundary = {0: false, 1: false}
 	ko_this_boundary = {0: false, 1: false}
 	accepted_requests.clear()
+	onset_slots = {0: "", 1: ""}
+	quick_releases = []
 	last_step_ms = 0.0
 	elapsed_usec = t0
 
@@ -301,6 +482,14 @@ func step() -> void:
 		return
 	_tick_start()
 	tick += 1
+	if _is_baby() and aborted:
+		# Already-requested abort ends before new combat/returns (Architect §5.1).
+		_end_encounter_baby(4, -1)
+		active_ticks += 1
+		telemetry.mark_activity(active_ticks)
+		last_step_ms = float(Time.get_ticks_usec() - elapsed_usec) / 1000.0
+		sim_time_ms_samples.append(last_step_ms)
+		return
 	_cut1()
 	_cut2()
 	_cut3()
@@ -311,7 +500,7 @@ func step() -> void:
 	telemetry.mark_activity(active_ticks)
 	if active_ticks % 60 == 0:
 		_emit_checkpoint()
-	if active_ticks >= int(content.tuning["timeout_active_ticks"]) and not ended:
+	if not _is_baby() and active_ticks >= int(content.tuning["timeout_active_ticks"]) and not ended:
 		_end_encounter(3, -1)
 	var dt := float(Time.get_ticks_usec() - elapsed_usec) / 1000.0
 	last_step_ms = dt
@@ -466,6 +655,8 @@ func _cut2() -> void:
 			pass
 		_plan_and_start(a)
 	_advance_actions()
+	if _is_baby():
+		_prey_plan_cut()
 	_movement_cut()
 
 
@@ -889,6 +1080,10 @@ func _emit_response(a: Dictionary, e: Dictionary, cls: int, original: int,
 		int(a["accepted_intent"]["expiry_tick"]) if a["accepted_intent"] != null else null])
 	if int(a["actor_id"]) == 0:
 		var cue := _feedback_cue(cls, original, interpreted, safe_reason)
+		# QA F02: only THIS episode's actual successful finalization emits Understood; the initial
+		# 12-tick wait keeps class4/telemetry and still reads as Hesitating.
+		if cls == 4 and bool(e.get("draw_resolved", false)):
+			cue = {"cue": "Understood: %s" % FAMILY_LABEL[original], "detail": ""}
 		human_feedback.append({
 			"recipient": 0, "request": rid, "tick": tick, "cue": cue["cue"],
 			"detail": cue["detail"], "family": original, "kind": "response",
@@ -1004,7 +1199,11 @@ func _plan_and_start(a: Dictionary) -> void:
 		if a["goal"] != null:
 			_execute_goal(a)
 		return
-	_execute_plan(a, enemy)
+	var attack_view := {}
+	if _is_baby():
+		var ref := _select_attack_target(a)
+		attack_view = _attack_view_for(a, ref)
+	_execute_plan(a, enemy, attack_view)
 	_remember_plan_watch(a)
 
 
@@ -1046,13 +1245,117 @@ func _remember_plan_watch(a: Dictionary) -> void:
 	plan_watch[int(a["actor_id"])] = _plan_watch(a)
 
 
-func _execute_plan(a: Dictionary, enemy: Dictionary) -> void:
+func _sq_dist(p: Array, a: Dictionary) -> float:
+	var dx := float(p[0]) - float(a["x"])
+	var dy := float(p[1]) - float(a["y"])
+	return dx * dx + dy * dy
+
+
+func _los_vision(a: Dictionary, p: Array) -> bool:
+	var dx := float(p[0]) - float(a["x"])
+	var dy := float(p[1]) - float(a["y"])
+	if dx * dx + dy * dy > arena.vision * arena.vision:
+		return false
+	return arena.line_of_effect(float(a["x"]), float(a["y"]), float(p[0]), float(p[1]))
+
+
+func _prey_visible_to(a: Dictionary, slot: int) -> bool:
+	if not _is_baby() or slot < 0 or slot >= prey_slots.size():
+		return false
+	var p: Dictionary = prey_slots[slot]
+	if not bool(p["live"]):
+		return false
+	return _los_vision(a, [float(p["x"]), float(p["y"])])
+
+
+func _attack_legal(a: Dictionary, ref: Variant) -> bool:
+	var r := _resolve_ref(ref)
+	if r.is_empty():
+		return false
+	if int(r["id"]) == int(a["actor_id"]) and str(r["kind"]) == "monster":
+		return false
+	if str(r["kind"]) == "monster":
+		if not bool(a["enemy_visible"]):
+			return false
+		return _los_vision(a, _entity_pos("monster", int(r["id"])))
+	return _prey_visible_to(a, int(r["id"]))
+
+
+## Normal target-selection boundary: retain a live, lawfully visible, eligible target;
+## otherwise choose the nearest visible live opponent/prey (tie opponent, then lower slot).
+## With none visible, a live previous target with lawful frozen memory is retained for SEARCH
+## only; attack still requires current visibility.
+func _select_attack_target(a: Dictionary) -> Dictionary:
+	var cur: Variant = a.get("selected_target", {})
+	var cur_ref: Dictionary = cur as Dictionary if cur is Dictionary else {}
+	if not cur_ref.is_empty() and _attack_legal(a, cur_ref):
+		return cur_ref
+	var best := {}
+	var best_d := INF
+	var opp := 1 - int(a["actor_id"])
+	var opp_ref := _make_ref("monster", opp, int(actors[opp]["life_id"]))
+	if _attack_legal(a, opp_ref):
+		best = opp_ref
+		best_d = _sq_dist(_entity_pos("monster", opp), a)
+	for s in 2:
+		if not _is_baby():
+			break
+		var pref := _make_ref("prey", s, int(prey_slots[s]["life_id"]))
+		if not _attack_legal(a, pref):
+			continue
+		var d2 := _sq_dist(_entity_pos("prey", s), a)
+		if d2 < best_d - 1e-9:
+			best_d = d2
+			best = pref
+	if not best.is_empty():
+		a["selected_target"] = best
+		return best
+	# C06: no visible target. Retain a prey target for lawful frozen last-seen SEARCH based only
+	# on permitted observer knowledge/expiry — never on authoritative hidden live state, so an
+	# unseen depletion/respawn cannot cancel search. Attack eligibility stays visibility-gated.
+	if not cur_ref.is_empty() and str(cur_ref.get("kind", "")) == "prey" \
+			and int(cur_ref.get("id", -1)) >= 0 \
+			and int(cur_ref["id"]) < (a["prey_knowledge"] as Array).size():
+		var k: Dictionary = (a["prey_knowledge"] as Array)[int(cur_ref["id"])]
+		if int(k["life_id"]) == int(cur_ref["life_id"]) and bool(k["memory_valid"]):
+			return cur_ref
+	a["selected_target"] = {}
+	return {}
+
+
+func _attack_view_for(a: Dictionary, ref: Dictionary) -> Dictionary:
+	if ref.is_empty():
+		return {}
+	var visible := _attack_legal(a, ref)
+	var view := {"ref": ref.duplicate(true), "visible": visible}
+	if visible:
+		var pos := _entity_pos(str(ref["kind"]), int(ref["id"]))
+		view["x"] = float(pos[0])
+		view["y"] = float(pos[1])
+	elif str(ref["kind"]) == "prey":
+		# Frozen last-seen point only; hidden live coordinates never enter the view.
+		var k: Dictionary = (a["prey_knowledge"] as Array)[int(ref["id"])]
+		if int(k["life_id"]) == int(ref["life_id"]) and bool(k["memory_valid"]):
+			view["x"] = float(k["x"])
+			view["y"] = float(k["y"])
+			view["memory"] = {"valid": true, "x": float(k["x"]), "y": float(k["y"]),
+				"token": int(k["token"])}
+		else:
+			view["x"] = 0.0
+			view["y"] = 0.0
+	else:
+		view["x"] = 0.0
+		view["y"] = 0.0
+	return view
+
+
+func _execute_plan(a: Dictionary, enemy: Dictionary, attack_view: Dictionary = {}) -> void:
 	var knowledge := "unknown"
 	if bool(a["enemy_visible"]):
 		knowledge = "visible"
 	elif bool(a["memory_valid"]):
 		knowledge = "last_known"
-	var plan := behavior.plan(a, enemy, tick, knowledge)
+	var plan := behavior.plan(a, enemy, tick, knowledge, attack_view)
 	nav_searches += behavior.decision_searches
 	nav_expansions += behavior.decision_expansions
 	nav_violations += behavior.decision_violations
@@ -1203,14 +1506,32 @@ func _try_start(a: Dictionary, sid: String, plan: Dictionary, enemy: Dictionary)
 	if not bool(a["ready"].get(sid, false)):
 		return
 	var def := content.skill(sid)
+	var attack_ref := {}
 	if sid == "quick_claw":
-		if not bool(enemy["alive"]) or not bool(a["enemy_visible"]):
-			return
-		var d := sqrt(pow(float(enemy["x"]) - float(a["x"]), 2.0) + pow(float(enemy["y"]) - float(a["y"]), 2.0))
-		if d > float(def["range_mwu"]):
-			return
-		if not arena.line_of_effect(float(a["x"]), float(a["y"]), float(enemy["x"]), float(enemy["y"])):
-			return
+		if _is_baby():
+			attack_ref = _resolve_ref(plan.get("attack_ref", {}))
+			if attack_ref.is_empty():
+				return
+			var tp := _entity_pos(str(attack_ref["kind"]), int(attack_ref["id"]))
+			var d := sqrt(pow(float(tp[0]) - float(a["x"]), 2.0)
+				+ pow(float(tp[1]) - float(a["y"]), 2.0))
+			if d > float(def["range_mwu"]):
+				return
+			if not _attack_legal(a, attack_ref):
+				return
+			if not arena.line_of_effect(float(a["x"]), float(a["y"]),
+					float(tp[0]), float(tp[1])):
+				return
+		else:
+			if not bool(enemy["alive"]) or not bool(a["enemy_visible"]):
+				return
+			var d := sqrt(pow(float(enemy["x"]) - float(a["x"]), 2.0)
+				+ pow(float(enemy["y"]) - float(a["y"]), 2.0))
+			if d > float(def["range_mwu"]):
+				return
+			if not arena.line_of_effect(float(a["x"]), float(a["y"]),
+					float(enemy["x"]), float(enemy["y"])):
+				return
 	if sid == "short_bound":
 		var goal: Variant = plan.get("goal", null)
 		var route: Array = []
@@ -1233,7 +1554,10 @@ func _try_start(a: Dictionary, sid: String, plan: Dictionary, enemy: Dictionary)
 	var target_kind := 2 if sid == "quick_claw" else (1 if sid == "brace" else 3)
 	var target: Variant = null
 	if sid == "quick_claw":
-		target = 1 - int(a["actor_id"])
+		if _is_baby() and not attack_ref.is_empty():
+			target = _entity_id_encoded(str(attack_ref["kind"]), int(attack_ref["id"]))
+		else:
+			target = 1 - int(a["actor_id"])
 	elif sid == "short_bound":
 		var g: Dictionary = plan["goal"]
 		var ep: Array = g["route"][g["route"].size() - 1]
@@ -1263,6 +1587,9 @@ func _try_start(a: Dictionary, sid: String, plan: Dictionary, enemy: Dictionary)
 		owning = int(plan.get("context_family", -1))
 	var action := {
 		"action": aid, "actor": int(a["actor_id"]), "life": 1,
+		"life_id": int(a["life_id"]),
+		"target_ref": attack_ref.duplicate(true),
+		"target_life_id": int(attack_ref.get("life_id", -1)) if not attack_ref.is_empty() else null,
 		"request": int((held as Dictionary).get("request", 0)) if has_intent else 0,
 		"episode": int((held as Dictionary).get("episode", 0)) if has_intent else 0,
 		"intent": int((held as Dictionary).get("intent", -1)) if has_intent else -1,
@@ -1285,8 +1612,11 @@ func _try_start(a: Dictionary, sid: String, plan: Dictionary, enemy: Dictionary)
 	a["cycle_episode"] = int(action["episode"])
 	a["recovery_owner"] = int(action["intent"])
 	a["rest_idle_ticks"] = 0
-	telemetry.emit(tick, 6, [aid, int(a["actor_id"]), 1,
-		int(action["request"]), sid, target, due, due + content.recovery_ticks(sid)])
+	var ev6 := [aid, int(a["actor_id"]), int(a["life_id"]) if _is_baby() else 1,
+		int(action["request"]), sid, target, due, due + content.recovery_ticks(sid)]
+	if _is_baby():
+		ev6.append(int(attack_ref.get("life_id", -1)) if not attack_ref.is_empty() else null)
+	telemetry.emit(tick, 6, ev6)
 	telemetry.emit(tick, 7, [aid, int(a["actor_id"]), cost, int(a["stam"]), int(a["cooldown_end"][sid])])
 	if sid == "short_bound":
 		var g2: Dictionary = plan["goal"]
@@ -1321,43 +1651,128 @@ func _advance_actions() -> void:
 			telemetry.emit(tick, 8, [int(d["action"]), int(a["actor_id"])])
 
 
+## R2: normalizes a captured EntityRef. Only a complete, in-range kind/id/life is accepted;
+## incomplete nonempty dictionaries fail safely and never bind the current life.
+func _normalize_ref(raw: Variant) -> Dictionary:
+	if not (raw is Dictionary):
+		return {}
+	var r := raw as Dictionary
+	var kind := str(r.get("kind", ""))
+	if kind != "monster" and kind != "prey":
+		return {}
+	if not r.has("id") or not r.has("life_id"):
+		return {}
+	var id_raw: Variant = r["id"]
+	var life_raw: Variant = r["life_id"]
+	if not (id_raw is int) or not (life_raw is int):
+		return {}
+	var id := int(id_raw)
+	var life := int(life_raw)
+	if life <= 0:
+		return {}
+	if kind == "monster":
+		if id < 0 or id > 1:
+			return {}
+	else:
+		if id < 0 or id >= prey_slots.size():
+			return {}
+	return _make_ref(kind, id, life)
+
+
+func _effect_target_ref(e: Dictionary) -> Dictionary:
+	var tr: Variant = e.get("target_ref", {})
+	if tr is Dictionary and not (tr as Dictionary).is_empty():
+		return _normalize_ref(tr)
+	if _is_baby():
+		# Expanded effects must carry a captured identity; never bind the CURRENT life.
+		return {}
+	var idx := int(e.get("target", -1))
+	if idx >= 0 and idx <= 1:
+		return _make_ref("monster", idx, int(actors[idx]["life_id"]))
+	return {}
+
+
+## Emits the invalid-life IMPACT row for an effect whose captured kind/id/life is not a live,
+## matching entity. Never binds a replacement life and never indexes an incomplete ref.
+func _emit_invalid_effect(e: Dictionary, ref: Dictionary) -> void:
+	var norm := _normalize_ref(ref)
+	var enc: Variant = int(e.get("target", -1))
+	var life: Variant = null
+	if not norm.is_empty():
+		enc = _entity_id_encoded(str(norm["kind"]), int(norm["id"]))
+		life = int(norm["life_id"])
+	elif ref is Dictionary and not ref.is_empty():
+		# Preserve the encoded target when known, but never require absent keys.
+		var raw_id: Variant = (ref as Dictionary).get("id", null)
+		if raw_id is int and int(raw_id) >= 0 and int(raw_id) <= 3:
+			enc = int(raw_id)
+	telemetry.emit(tick, 11, [int(e["effect"]), int(e.get("action", 0)),
+		int(e.get("source", 0)), enc, life, "invalid_life", int(e.get("batch", 0)),
+		"%d:%s:%s" % [int(e.get("batch", 0)), str(enc), str(life)]])
+	if int(e.get("source", 0)) == 0:
+		_record("Miss", "", 1, "action")
+
+
+## C01: validates captured kind/id/life/live BEFORE impact/interruption, then carries valid
+## qualified arrivals forward so the later settlement applies them exactly once. Source KO never
+## retracts already-committed work.
 func _cut3() -> void:
 	for i in 2:
 		var a: Dictionary = actors[i]
 		a["def_frozen"] = int(a["def"])
 		a["brace_frozen"] = int(a["brace_end"]) > tick and int(a["brace_start"]) >= 0 and tick > int(a["brace_start"])
-	var qualified: Array = []
+	var keep: Array = []
 	for e in pending_effects:
 		if int(e.get("impact_tick", -1)) != tick:
+			keep.append(e)
 			continue
 		if str(e.get("qualification", "qualified")) != "qualified":
+			var bref := _effect_target_ref(e)
+			var b_life := int(bref.get("life_id", -1)) if not bref.is_empty() else int(e.get("target", -1))
+			var b_tgt: Variant = _entity_id_encoded(str(bref["kind"]), int(bref["id"])) if not bref.is_empty() else int(e.get("target", -1))
 			telemetry.emit(tick, 11, [int(e["effect"]), int(e.get("action", 0)), int(e.get("source", 0)),
-				int(e["target"]), int(actors[int(e["target"])]["life"]), "blocked", int(e.get("batch", 0)), ""])
+				b_tgt, b_life, "blocked", int(e.get("batch", 0)), ""])
 			continue
-		qualified.append(e)
-	pending_effects = pending_effects.filter(func(e): return int(e.get("impact_tick", -1)) != tick)
-	for e in qualified:
-		var tgt_idx := int(e["target"])
-		var tgt: Dictionary = actors[tgt_idx]
-		var act: Variant = tgt["action"]
-		if act != null and act is Dictionary:
-			var d := act as Dictionary
-			if str(d["state"]) in ["preparing", "due"] and int(content.charge_ticks(str(d["skill"]))) > 0:
-				if int(e.get("interrupt_power", 1)) >= int(d["stability"]):
-					d["state"] = "cancelled"
-					d["cancel_cause"] = "interrupt"
-					tgt["recovery_end"] = tick + int(d["recovery_ticks"])
-					cancelled_this_boundary[tgt_idx] = true
-					telemetry.emit(tick, 10, [int(d["action"]), tgt_idx, int(e["effect"]), "interruption"])
-					if tgt_idx == 0:
-						# COMMAND-FEEDBACK01: own prior-impact interruption is observable
-						# through the existing public channel only. No NPC cue, no duplicate
-						# telemetry CANCEL; action-null and event11 ordering stay intact.
-						_record("Interrupted", "", 0, "action")
-					tgt["action"] = null
-		telemetry.emit(tick, 11, [int(e["effect"]), int(e.get("action", 0)), int(e.get("source", 0)),
-			tgt_idx, int(tgt["life"]), "hit", int(e.get("batch", 0)),
-			"%d:%d:%d" % [int(e.get("batch", 0)), tgt_idx, int(tgt["life"])]])
+		var ref := _effect_target_ref(e)
+		var valid := false
+		if _is_baby():
+			valid = not ref.is_empty() and not _resolve_ref(ref).is_empty()
+		else:
+			var lidx := int(ref.get("id", int(e.get("target", -1))))
+			valid = lidx >= 0 and lidx <= 1 and bool(actors[lidx]["alive"])
+		if not valid:
+			_emit_invalid_effect(e, ref)
+			continue
+		var tgt_idx := int(ref["id"])
+		var tgt_life := int(ref.get("life_id", -1))
+		if str(ref["kind"]) == "monster":
+			var tgt: Dictionary = actors[tgt_idx]
+			var act: Variant = tgt["action"]
+			if act != null and act is Dictionary:
+				var d := act as Dictionary
+				if str(d["state"]) in ["preparing", "due"] and int(content.charge_ticks(str(d["skill"]))) > 0:
+					if int(e.get("interrupt_power", 1)) >= int(d["stability"]):
+						d["state"] = "cancelled"
+						d["cancel_cause"] = "interrupt"
+						tgt["recovery_end"] = tick + int(d["recovery_ticks"])
+						cancelled_this_boundary[tgt_idx] = true
+						telemetry.emit(tick, 10, [int(d["action"]), tgt_idx, int(e["effect"]), "interruption"])
+						if tgt_idx == 0:
+							_record("Interrupted", "", 0, "action")
+						tgt["action"] = null
+			var hit_life: Variant = tgt_life if _is_baby() else int(tgt["life"])
+			telemetry.emit(tick, 11, [int(e["effect"]), int(e.get("action", 0)), int(e.get("source", 0)),
+				tgt_idx, hit_life, "hit", int(e.get("batch", 0)),
+				"%d:%d:%d" % [int(e.get("batch", 0)), tgt_idx, int(tgt["life"])]])
+		else:
+			var enc := _entity_id_encoded("prey", tgt_idx)
+			var hit_life2: Variant = tgt_life if _is_baby() else -1
+			telemetry.emit(tick, 11, [int(e["effect"]), int(e.get("action", 0)), int(e.get("source", 0)),
+				enc, hit_life2, "hit", int(e.get("batch", 0)),
+				"%d:%d:%d" % [int(e.get("batch", 0)), enc, tgt_life]])
+		# Carry the validated arrival forward: _cut5(_baby) settles it exactly once this tick.
+		keep.append(e)
+	pending_effects = keep
 	for i in 2:
 		_refresh_gates(actors[i])
 
@@ -1403,14 +1818,30 @@ func _cut4() -> void:
 			var eid := int(id_counter["effect"])
 			id_counter["effect"] = eid + 1
 			var def := content.skill(sid)
+			var tref: Dictionary = {}
+			var trv: Variant = d.get("target_ref", {})
+			if trv is Dictionary:
+				tref = trv as Dictionary
+			var tgt_idx := int(tref.get("id", int(d["target"]))) if not tref.is_empty() else int(d["target"])
+			var tgt_life := int(tref.get("life_id", int(actors[tgt_idx]["life_id"]))) if not tref.is_empty() else int(actors[tgt_idx]["life_id"])
+			var tgt_enc: Variant = _entity_id_encoded(str(tref.get("kind", "monster")), tgt_idx) if not tref.is_empty() else tgt_idx
+			var tgt_def := int(actors[tgt_idx]["def"])
+			var tgt_k := int(actors[tgt_idx]["k_defense"])
+			if not tref.is_empty() and str(tref.get("kind", "monster")) == "prey":
+				tgt_def = int(_baby()["prey"]["def"])
+				tgt_k = int(content.species["k_defense"])
 			effects.append({
 				"effect": eid, "action": int(d["action"]), "source": i,
-				"target": int(d["target"]), "kind": "damage",
+				"target": tgt_enc, "target_ref": tref.duplicate(true),
+				"target_life_id": tgt_life if not tref.is_empty() else int(actors[tgt_idx]["life_id"]),
+				"source_life_id": int(a["life_id"]),
+				"kind": "damage",
 				"impact_tick": tick, "interrupt_power": int(def["interrupt_power"]),
 				"qualification": "qualified", "batch": batch,
 				"base_power_cp": int(def["base_power_cp"]),
 				"source_atk": int(a["atk"]),
-				"target_def": int(actors[int(d["target"])]["def"]),
+				"target_def": tgt_def,
+				"target_k_defense": tgt_k,
 				"brace_factor_bp": 10000,
 				"phase_factor_bp": 10000,
 			})
@@ -1428,6 +1859,12 @@ func _cut4() -> void:
 			telemetry.emit(tick, 15, [i, int(d["action"]), tick + 1, int(a["brace_end"]), "activate"])
 			a["public_action"] = "bracing"
 		elif sid == "short_bound":
+			# Architect §6: capture the selected plan's purpose BEFORE the action clear so the
+			# bound onset can be classified truthfully later.
+			var pv: Variant = d.get("plan", {})
+			if pv is Dictionary:
+				a["bound_purpose"] = int((pv as Dictionary).get("context_family", -1))
+			a["onset_bound_action"] = -1
 			a["bound_active"] = true
 			a["bound_progress"] = 0.0
 			a["action"] = null
@@ -1451,6 +1888,14 @@ func _cut4() -> void:
 			_record(released, "", int(content.skill(sid).get("family", 1)), "action")
 		for e in effects:
 			pending_effects.append(e)
+		# Presentation-only Quick release at the committed origin/facing, after event9 and own
+		# release feedback. Own side always; enemy only when observer0 lawfully sees it.
+		if sid == "quick_claw":
+			if i == 0 or M01Observations.visibility_state(actors[0], tick) == 2:
+				quick_releases.append({"side": i, "life_id": int(a["life_id"]), "tick": tick,
+					"x": float(a["x"]), "y": float(a["y"]), "facing": int(a["facing"])})
+				public_quick_release.emit(i, int(a["life_id"]), tick, float(a["x"]),
+					float(a["y"]), int(a["facing"]))
 	_refresh_gates(actors[0])
 	_refresh_gates(actors[1])
 
@@ -1458,6 +1903,21 @@ func _cut4() -> void:
 func _release_legal(a: Dictionary, d: Dictionary) -> bool:
 	var sid := str(d["skill"])
 	if sid == "quick_claw":
+		var ref: Variant = d.get("target_ref", {})
+		if ref is Dictionary and not (ref as Dictionary).is_empty():
+			var r := _resolve_ref(ref)
+			if r.is_empty():
+				return false
+			var tp := _entity_pos(str(r["kind"]), int(r["id"]))
+			var def := content.skill(sid)
+			var dist := sqrt(pow(float(tp[0]) - float(a["x"]), 2.0)
+				+ pow(float(tp[1]) - float(a["y"]), 2.0))
+			if dist > float(def["range_mwu"]):
+				return false
+			if not arena.line_of_effect(float(a["x"]), float(a["y"]),
+					float(tp[0]), float(tp[1])):
+				return false
+			return _attack_legal(a, r)
 		var tgt: Dictionary = actors[int(d["target"])]
 		if not bool(tgt["alive"]):
 			return false
@@ -1473,6 +1933,9 @@ func _release_legal(a: Dictionary, d: Dictionary) -> bool:
 
 
 func _cut5() -> void:
+	if _is_baby():
+		_cut5_baby()
+		return
 	batch_counter += 1
 	var batch := batch_counter
 	var healing := {0: 0, 1: 0}
@@ -1553,6 +2016,446 @@ func _flush_due_arrivals() -> void:
 	pass
 
 
+## Integer largest-remainder split of the credited HP loss across the two contributing sides.
+func _allocate_credit(loss: int, d0: int, d1: int) -> Array:
+	var total := d0 + d1
+	if loss <= 0 or total <= 0:
+		return [0, 0]
+	var s0 := (loss * d0) / total
+	var s1 := (loss * d1) / total
+	var rem := loss - s0 - s1
+	if rem > 0:
+		var r0 := (loss * d0) % total
+		var r1 := (loss * d1) % total
+		if r1 > r0:
+			s1 += 1
+		else:
+			s0 += 1
+	return [s0, s1]
+
+
+func _credit_winner(p: Dictionary) -> int:
+	var c0 := int((p["credited"] as Array)[0])
+	var c1 := int((p["credited"] as Array)[1])
+	if c0 <= 0 and c1 <= 0:
+		return -1
+	if c0 > c1:
+		return 0
+	if c1 > c0:
+		return 1
+	var t0 := int((p["first_credit"] as Array)[0])
+	var t1 := int((p["first_credit"] as Array)[1])
+	if t0 >= 0 and t1 >= 0:
+		if t0 < t1:
+			return 0
+		if t1 < t0:
+			return 1
+	elif t0 >= 0:
+		return 0
+	elif t1 >= 0:
+		return 1
+	return 0
+
+
+func _lifecycle_entity(kind: String, id: int) -> int:
+	return _entity_id_encoded(kind, id)
+
+
+func _emit_lifecycle(transition: String, kind: String, id: int, old_life: int,
+		new_life: int, due: Variant, pos: Variant, batch: Variant) -> void:
+	telemetry.emit(tick, 27, [transition, _lifecycle_entity(kind, id), old_life, new_life,
+		due, pos, batch])
+
+
+## Expanded post-damage settlement. Order follows Architect §5: settle damage groups and credit,
+## award newly depleted prey, then the true-end check, then due returns/spawns. Monster KO is
+## nonterminal here.
+func _cut5_baby() -> void:
+	batch_counter += 1
+	var batch := batch_counter
+	var healing := {0: 0, 1: 0}
+	var to_apply: Array = []
+	for e in pending_effects:
+		if int(e.get("impact_tick", -1)) != tick:
+			continue
+		if str(e.get("kind", "")) == "damage":
+			to_apply.append(e)
+		elif str(e.get("kind", "")) == "heal":
+			var hidx := int(e.get("target", -1))
+			if hidx >= 0 and hidx <= 1:
+				healing[hidx] = int(healing[hidx]) + int(e.get("permit_cp", 0))
+				telemetry.emit(tick, 13, [int(e["effect"]), hidx, batch,
+					int(e.get("permit_cp", 0))])
+	pending_effects = pending_effects.filter(func(e): return int(e.get("impact_tick", -1)) != tick)
+
+	var mon_damage := {0: 0, 1: 0}
+	var mon_contrib := {0: [], 1: []}
+	var mon_hp_start := {0: int(actors[0]["hp"]), 1: int(actors[1]["hp"])}
+	var prey_group := {}
+	for s in prey_slots.size():
+		prey_group[s] = {"d": [0, 0], "effects": [], "hp_start": int(prey_slots[s]["hp"])}
+	var player_hit := false
+
+	# Phase A: compute every effective hit. DAMAGE rows for monsters carry no prey credit.
+	for e in to_apply:
+		var ref := _effect_target_ref(e)
+		if ref.is_empty():
+			continue
+		var kind := str(ref["kind"])
+		var id := int(ref["id"])
+		var eff_life := int(ref.get("life_id", -1))
+		if kind == "monster":
+			var tgt: Dictionary = actors[id]
+			if not bool(tgt["alive"]) or int(tgt["life_id"]) != eff_life:
+				telemetry.emit(tick, 11, [int(e["effect"]), int(e.get("action", 0)),
+					int(e.get("source", 0)), id, eff_life, "invalid_life", batch,
+					"%d:%d:%d" % [batch, id, eff_life]])
+				if int(e.get("source", 0)) == 0:
+					_record("Miss", "", 1, "action")
+				continue
+			var brace_bp := 10000
+			if int(tgt["brace_end"]) > tick and int(tgt["brace_start"]) >= 0 \
+					and tick > int(tgt["brace_start"]):
+				brace_bp = int(content.skill("brace")["mitigation_bp"])
+			var base_power := int(e["base_power_cp"])
+			var src_atk := int(e["source_atk"])
+			var tdef := int(tgt["def"])
+			var k := int(tgt["k_defense"])
+			var raw := float(base_power) * float(src_atk) / 100.0
+			raw = raw * float(k) / float(k + maxf(0.0, float(tdef)))
+			raw = raw * float(brace_bp) / 10000.0
+			var effective := maxi(0, int(floor(raw + 0.5)))
+			mon_damage[id] = int(mon_damage[id]) + effective
+			mon_contrib[id].append(int(e["effect"]))
+			if effective > 0 and (int(e.get("source", 0)) == 0 or id == 0):
+				player_hit = true
+			telemetry.emit(tick, 12, [int(e["effect"]), id, batch, base_power, src_atk,
+				tdef, brace_bp, 10000, effective, eff_life, null])
+		else:
+			if id < 0 or id >= prey_slots.size():
+				continue
+			var p: Dictionary = prey_slots[id]
+			if not bool(p["live"]) or int(p["life_id"]) != eff_life:
+				telemetry.emit(tick, 11, [int(e["effect"]), int(e.get("action", 0)),
+					int(e.get("source", 0)), _entity_id_encoded("prey", id), eff_life,
+					"invalid_life", batch, "%d:%d:%d" % [batch, 2 + id, eff_life]])
+				if int(e.get("source", 0)) == 0:
+					_record("Miss", "", 1, "action")
+				continue
+			var pdef := int(_baby()["prey"]["def"])
+			var pk := int(content.species["k_defense"])
+			var pbase := int(e["base_power_cp"])
+			var patk := int(e["source_atk"])
+			var praw := float(pbase) * float(patk) / 100.0
+			praw = praw * float(pk) / float(pk + maxf(0.0, float(pdef)))
+			var peff := maxi(0, int(floor(praw + 0.5)))
+			if peff > 0 and int(e.get("source", 0)) == 0:
+				player_hit = true
+			var grp: Dictionary = prey_group[id]
+			var dside: Array = grp["d"]
+			dside[int(e.get("source", 0))] = int(dside[int(e.get("source", 0))]) + peff
+			grp["d"] = dside
+			(grp["effects"] as Array).append([e, peff])
+
+	# Phase B: prey credit is settled before that group's DAMAGE rows are emitted.
+	for s in prey_slots.size():
+		var grp2: Dictionary = prey_group[s]
+		var p2: Dictionary = prey_slots[s]
+		var dvals: Array = grp2["d"]
+		if not bool(p2["live"]):
+			continue
+		var loss := mini(maxi(0, int(grp2["hp_start"])), int(dvals[0]) + int(dvals[1]))
+		var share := _allocate_credit(loss, int(dvals[0]), int(dvals[1]))
+		var credited: Array = p2["credited"]
+		var first: Array = p2["first_credit"]
+		for side in 2:
+			if int(share[side]) > 0:
+				credited[side] = int(credited[side]) + int(share[side])
+				if int(first[side]) < 0:
+					first[side] = tick
+		p2["credited"] = credited
+		p2["first_credit"] = first
+		for pair in (grp2["effects"] as Array):
+			var eff: Dictionary = pair[0]
+			var peff2 := int(pair[1])
+			telemetry.emit(tick, 12, [int(eff["effect"]), _entity_id_encoded("prey", s), batch,
+				int(eff["base_power_cp"]), int(eff["source_atk"]),
+				int(_baby()["prey"]["def"]), 10000, 10000, peff2,
+				int(p2["life_id"]), [int(credited[0]), int(credited[1])]])
+
+	if player_hit:
+		_record("Hit", "", 1, "action")
+
+	# Phase C: monster HP settlement and nonterminal down transition.
+	for i in 2:
+		var a: Dictionary = actors[i]
+		if not bool(a["alive"]):
+			continue
+		var after := int(mon_hp_start[i]) + int(healing[i]) - int(mon_damage[i])
+		after = clampi(after, 0, int(a["hp_max"]))
+		a["hp"] = after
+		if after <= 0:
+			a["alive"] = false
+			a["life"] = 1
+			a["lifecycle"] = "down"
+			a["return_due"] = tick + _baby_ticks("baby_return_ticks")
+			a["return_wait_announced"] = false
+			ko_this_boundary[i] = true
+			telemetry.emit(tick, 19, [i, int(a["life_id"]), batch, mon_contrib[i]])
+			_cancel_on_ko(a)
+			gateway.purge_actor(i)
+			_emit_lifecycle("monster_down", "monster", i, int(a["life_id"]),
+				int(a["life_id"]), int(a["return_due"]),
+				[float(a["x"]), float(a["y"])], batch)
+			if i == 0:
+				_record("Your monster is down — returning to your Nest", "", 0, "lifecycle")
+
+	# Phase D: prey depletion, one award per prey life, slots ascending.
+	for s in prey_slots.size():
+		var p3: Dictionary = prey_slots[s]
+		if not bool(p3["live"]):
+			continue
+		var g3: Dictionary = prey_group[s]
+		var dv: Array = g3["d"]
+		var applied := mini(maxi(0, int(g3["hp_start"])), int(dv[0]) + int(dv[1]))
+		p3["hp"] = maxi(0, int(g3["hp_start"]) - applied)
+		if int(p3["hp"]) > 0:
+			continue
+		p3["live"] = false
+		p3["respawn_due"] = tick + _baby_ticks("baby_prey_respawn_ticks")
+		p3["spawn_wait_announced"] = false
+		p3["route"] = []
+		p3["route_i"] = 0
+		_emit_lifecycle("prey_depleted", "prey", s, int(p3["life_id"]),
+			int(p3["life_id"]), int(p3["respawn_due"]),
+			[float(p3["x"]), float(p3["y"])], batch)
+		_award_prey(s, g3)
+
+	# Phase E: true end precedes due placements; abort wins a same-boundary deadline.
+	if aborted or tick >= _baby_ticks("baby_diagnostic_ticks"):
+		_end_encounter_baby(4 if aborted else 3, batch)
+		return
+	_process_due_lifecycles(batch)
+
+
+func _award_prey(slot: int, grp: Dictionary) -> void:
+	var p: Dictionary = prey_slots[slot]
+	var winner := _credit_winner(p)
+	var ordinal: Variant = null
+	var atk_delta := 0
+	var exp_delta := 0
+	var cum_atk: Variant = null
+	var cum_exp: Variant = null
+	if winner >= 0:
+		var cd := int(progression[winner]["credited_defeats"])
+		ordinal = 1 if cd == 0 else (2 if cd == 1 else 3)
+		var rewards: Array = _baby()["rewards"]
+		if int(ordinal) <= 2:
+			var rec: Dictionary = rewards[int(ordinal) - 1]
+			atk_delta = int(rec["pending_atk"])
+			exp_delta = int(rec["evolution_exp"])
+			progression[winner]["pending_atk"] = int(progression[winner]["pending_atk"]) + atk_delta
+			progression[winner]["evolution_exp"] = int(progression[winner]["evolution_exp"]) + exp_delta
+		progression[winner]["credited_defeats"] = mini(2, cd + 1)
+		cum_atk = int(progression[winner]["pending_atk"])
+		cum_exp = int(progression[winner]["evolution_exp"])
+		if winner == 0 and (atk_delta > 0 or exp_delta > 0):
+			actors[0]["growth_notice_tick"] = tick
+			_record("Hunt growth gained", "", 0, "growth")
+	var first: Array = p["first_credit"]
+	var dvals: Array = grp["d"]
+	var share := _allocate_credit(mini(maxi(0, int(grp["hp_start"])),
+		int(dvals[0]) + int(dvals[1])), int(dvals[0]), int(dvals[1]))
+	telemetry.emit(tick, 28, [slot, int(p["life_id"]), winner if winner >= 0 else null,
+		(p["credited"] as Array).duplicate(),
+		[int(first[0]) if int(first[0]) >= 0 else null,
+			int(first[1]) if int(first[1]) >= 0 else null],
+		[int(dvals[0]), int(dvals[1])], [int(share[0]), int(share[1])],
+		ordinal, atk_delta, exp_delta, cum_atk, cum_exp])
+
+
+## Due returns/spawns in stable order monster0, monster1, prey0, prey1. Blocked candidates keep
+## their ORIGINAL due tick and announce the wait once.
+func _process_due_lifecycles(batch: int) -> void:
+	for i in 2:
+		var a: Dictionary = actors[i]
+		if bool(a["alive"]) or int(a["return_due"]) < 0 or tick < int(a["return_due"]):
+			continue
+		if _try_place_monster(i):
+			var old_life := int(a["life_id"])
+			a["life_id"] = old_life + 1
+			a["alive"] = true
+			a["life"] = 0
+			a["lifecycle"] = "alive"
+			a["return_due"] = -1
+			a["return_wait_announced"] = false
+			a["returned_this_boundary"] = true
+			_restore_returned(a)
+			gateway.purge_actor(i)
+			_emit_lifecycle("monster_return", "monster", i, old_life, int(a["life_id"]),
+				null, [float(a["x"]), float(a["y"])], null)
+			if i == 0:
+				a["return_notice_tick"] = tick
+				_record("Returned to Nest", "", 0, "lifecycle")
+		elif not bool(a["return_wait_announced"]):
+			a["return_wait_announced"] = true
+			_emit_lifecycle("return_wait", "monster", i, int(a["life_id"]),
+				int(a["life_id"]), int(a["return_due"]), null, null)
+			if i == 0:
+				_record("Waiting for a clear return point", "", 0, "lifecycle")
+	for s in prey_slots.size():
+		var p: Dictionary = prey_slots[s]
+		if bool(p["live"]) or int(p["respawn_due"]) < 0 or tick < int(p["respawn_due"]):
+			continue
+		if _try_place_prey(s):
+			var old_life := int(p["life_id"])
+			p["life_id"] = old_life + 1
+			p["live"] = true
+			p["hp"] = int(p["hp_max"])
+			p["credited"] = [0, 0]
+			p["first_credit"] = [-1, -1]
+			p["route"] = []
+			p["route_i"] = 0
+			p["next_plan_tick"] = 0
+			p["respawn_due"] = -1
+			p["spawn_wait_announced"] = false
+			_emit_lifecycle("prey_spawn", "prey", s, old_life, int(p["life_id"]),
+				null, [float(p["x"]), float(p["y"])], null)
+		elif not bool(p["spawn_wait_announced"]):
+			p["spawn_wait_announced"] = true
+			_emit_lifecycle("spawn_wait", "prey", s, int(p["life_id"]),
+				int(p["life_id"]), int(p["respawn_due"]), null, null)
+
+
+func _placement_clear(kind: String, id: int, x: float, y: float, radius: float) -> bool:
+	if not arena.static_legal_for(x, y, radius):
+		return false
+	for i in 2:
+		if bool(actors[i]["alive"]):
+			var other := _entity_radius("monster", i)
+			var dx := float(actors[i]["x"]) - x
+			var dy := float(actors[i]["y"]) - y
+			if dx * dx + dy * dy < pow(radius + other + arena.GUARD, 2.0):
+				return false
+	for s in prey_slots.size():
+		if bool(prey_slots[s]["live"]):
+			var o2 := _entity_radius("prey", s)
+			var dx2 := float(prey_slots[s]["x"]) - x
+			var dy2 := float(prey_slots[s]["y"]) - y
+			if dx2 * dx2 + dy2 * dy2 < pow(radius + o2 + arena.GUARD, 2.0):
+				return false
+	if kind == "monster":
+		# Exclude self (it is down, so absent from the live sweep) — nothing else to do.
+		pass
+	else:
+		# Exclude this depleted slot (absent from the live sweep) — nothing else to do.
+		pass
+	return true
+
+
+func _try_place_monster(i: int) -> bool:
+	var a: Dictionary = actors[i]
+	var sec := _baby()
+	var center: Array = (sec["nests"]["centers"] as Array)[i]
+	var radius := float(a["radius"])
+	var cands := arena.placement_candidates(center, sec["placement_ring_radii_mwu"])
+	for c in cands:
+		placement_test_total += 1
+		if _placement_clear("monster", i, float(c[0]), float(c[1]), radius):
+			a["x"] = float(c[0])
+			a["y"] = float(c[1])
+			return true
+	return false
+
+
+func _try_place_prey(s: int) -> bool:
+	var p: Dictionary = prey_slots[s]
+	var sec := _baby()
+	var center: Array = (sec["prey"]["centers"] as Array)[s]
+	var radius := float(p["radius"])
+	var cands := arena.placement_candidates(center, sec["placement_ring_radii_mwu"])
+	for c in cands:
+		placement_test_total += 1
+		if _placement_clear("prey", s, float(c[0]), float(c[1]), radius):
+			p["x"] = float(c[0])
+			p["y"] = float(c[1])
+			return true
+	return false
+
+
+## Architect §6 exact restoration. Persistent build/stats/ledger/lifecycle generation remain.
+func _restore_returned(a: Dictionary) -> void:
+	a["hp"] = int(a["hp_max"])
+	a["stam"] = int(a["stam_max"])
+	a["fatigue_centi"] = 0
+	a["lock_end"] = 0
+	a["lock_latched"] = false
+	a["physical_locked"] = false
+	a["emotion"] = "Calm"
+	a["control_mode"] = 0
+	for sid in AUTHOR_SKILL_ORDER:
+		a["cooldown_end"][sid] = tick
+	a["recovery_end"] = tick
+	a["action"] = null
+	a["response_episode"] = null
+	a["accepted_intent"] = null
+	a["brace_action"] = -1
+	a["brace_start"] = -1
+	a["brace_end"] = -1
+	a["bound_active"] = false
+	a["bound_path"] = []
+	a["bound_progress"] = 0.0
+	a["bound_total"] = 0.0
+	a["bound_action"] = -1
+	a["bound_purpose"] = -1
+	a["onset_bound_action"] = -1
+	a["onset_prior_moving"] = false
+	a["onset_prior_category"] = ""
+	a["onset_prior_brace"] = false
+	a["goal"] = null
+	a["cycle_intent"] = -1
+	a["cycle_request"] = 0
+	a["cycle_episode"] = 0
+	a["recovery_owner"] = -1
+	a["rest_idle_ticks"] = 0
+	a["pressure"] = 0
+	a["pressure_key"] = ""
+	a["last_repeat_credit"] = -9999
+	a["last_plan"] = {}
+	a["next_plan_tick"] = 0
+	plan_watch[int(a["actor_id"])] = {}
+	a["memory_valid"] = false
+	a["memory_x"] = 0.0
+	a["memory_y"] = 0.0
+	a["memory_last_seen_tick"] = -1
+	a["memory_expiry"] = 0
+	a["memory_hp_band"] = -1
+	a["memory_form"] = ""
+	a["search_active"] = false
+	a["search_start"] = -1
+	a["search_deadline"] = -1
+	a["search_token_exhausted"] = {}
+	a["patrol_visited"] = []
+	a["search_visited"] = []
+	a["moved_this_boundary"] = false
+	a["def_frozen"] = int(a["def"])
+	a["brace_frozen"] = false
+	a["brace_prepare_action"] = -1
+	a["enemy_visible"] = false
+	a["public_action"] = ""
+	a["selected_target"] = {}
+	a["prey_knowledge"] = [_new_knowledge(0), _new_knowledge(1)]
+	a["last_hp_band"] = -1
+	a["last_stam_band"] = -1
+	a["last_fatigue_band"] = -1
+	var npc: Variant = a.get("npc", null)
+	if npc is Dictionary:
+		(npc as Dictionary)["queued"] = null
+		(npc as Dictionary)["history"] = []
+		(npc as Dictionary)["repeated_episode"] = false
+	_refresh_gates(a)
+
+
 func _cancel_on_ko(a: Dictionary) -> void:
 	a["action"] = null
 	a["bound_active"] = false
@@ -1566,12 +2469,42 @@ func _cancel_on_ko(a: Dictionary) -> void:
 	a["rest_idle_ticks"] = 0
 	a["cycle_request"] = 0
 	a["cycle_episode"] = 0
+	if _is_baby():
+		# A down actor does not plan, select, move or retain stale search influence.
+		a["goal"] = null
+		a["next_plan_tick"] = 0
+		a["selected_target"] = {}
+		a["search_active"] = false
+		a["search_start"] = -1
+		a["search_deadline"] = -1
+		a["memory_valid"] = false
+		a["enemy_visible"] = false
+		a["accepted_intent"] = null
+		a["pressure"] = 0
+		a["pressure_key"] = ""
+		a["last_plan"] = {}
+		a["bound_purpose"] = -1
+		a["onset_bound_action"] = -1
+		a["onset_prior_moving"] = false
+		a["onset_prior_category"] = ""
+		a["onset_prior_brace"] = false
+		a["public_action"] = "ko"
+		var npc: Variant = a.get("npc", null)
+		if npc is Dictionary:
+			(npc as Dictionary)["queued"] = null
+			(npc as Dictionary)["history"] = []
+			(npc as Dictionary)["repeated_episode"] = false
 
 
 func _cut6() -> void:
 	for i in 2:
 		var a: Dictionary = actors[i]
 		if not bool(a["alive"]):
+			continue
+		if bool(a.get("returned_this_boundary", false)):
+			# A body returned this boundary did not live the whole tick: no idle/resource credit.
+			a["returned_this_boundary"] = false
+			_publish_bands(a)
 			continue
 		_count_rest_idle(a)
 		if ko_this_boundary[i] or started_technique[i] or cancelled_this_boundary[i]:
@@ -1662,7 +2595,354 @@ func _publish_bands(a: Dictionary) -> void:
 		a["last_fatigue_band"] = fa_b
 
 
+## Radius-aware static clip (same contract as _clip_polyline, actual body radius).
+func _clip_polyline_for(proposal: Array, radius: float) -> Array:
+	var out: Array = [[float(proposal[0][0]), float(proposal[0][1])]]
+	for i in range(1, proposal.size()):
+		var frm: Array = out[out.size() - 1]
+		var to: Array = proposal[i]
+		var t := arena.swept_static_limit_for(frm, to, radius)
+		if t >= 1.0 - 1e-12:
+			out.append([float(to[0]), float(to[1])])
+			continue
+		if t > 1e-12:
+			out.append([float(frm[0]) + (float(to[0]) - float(frm[0])) * t,
+				float(frm[1]) + (float(to[1]) - float(frm[1])) * t])
+		break
+	return out
+
+
+## Prey flee trajectory for this boundary: walk the retained route from its cursor for `budget`.
+func _route_polyline(from: Array, route: Array, idx: int, budget: float) -> Array:
+	var out: Array = [[float(from[0]), float(from[1])]]
+	var remaining := budget
+	var i := idx
+	var cur: Array = [float(from[0]), float(from[1])]
+	while i < route.size() and remaining > 1e-9:
+		var wp: Array = route[i]
+		var dx := float(wp[0]) - float(cur[0])
+		var dy := float(wp[1]) - float(cur[1])
+		var d := sqrt(dx * dx + dy * dy)
+		if d <= 1e-9:
+			i += 1
+			continue
+		if d <= remaining + 1e-9:
+			out.append([float(wp[0]), float(wp[1])])
+			remaining -= d
+			cur = [float(wp[0]), float(wp[1])]
+			i += 1
+		else:
+			out.append([float(cur[0]) + dx * (remaining / d),
+				float(cur[1]) + dy * (remaining / d)])
+			break
+	return out
+
+
+func _body_moves(body: Dictionary) -> bool:
+	return float(body["intended"]) > 1e-12
+
+
+## C04: advance route progress from the PRE-step origin using the actual applied arc distance, so
+## a corner is only consumed when the committed polyline genuinely traverses it.
+func _advance_prey_cursor(p: Dictionary, origin: Array, travelled: float) -> void:
+	var route: Array = p["route"]
+	var i := int(p["route_i"])
+	var remaining := travelled
+	var cur: Array = [float(origin[0]), float(origin[1])]
+	while i < route.size() and remaining > 1e-9:
+		var wp: Array = route[i]
+		var dx := float(wp[0]) - float(cur[0])
+		var dy := float(wp[1]) - float(cur[1])
+		var d := sqrt(dx * dx + dy * dy)
+		if d <= 1e-9:
+			i += 1
+			continue
+		if d <= remaining + 1e-9:
+			remaining -= d
+			cur = [float(wp[0]), float(wp[1])]
+			i += 1
+		else:
+			break
+	p["route_i"] = i
+	if i >= route.size():
+		p["route"] = []
+		p["route_i"] = 0
+
+
+func _capture_onset(a: Dictionary, body: Dictionary) -> void:
+	var side := int(a["actor_id"])
+	var cat := "other"
+	if bool(body["bound"]):
+		var purpose := int(a["bound_purpose"])
+		if purpose == 2:
+			cat = "defensive_evasion"
+		elif purpose == 3:
+			cat = "escape"
+		else:
+			cat = "other"
+		if int(a["onset_bound_action"]) != int(a["bound_action"]):
+			a["onset_bound_action"] = int(a["bound_action"])
+			onset_slots[side] = cat
+		return
+	var goal: Variant = a["goal"]
+	var purpose2 := ""
+	if goal is Dictionary:
+		purpose2 = str((goal as Dictionary).get("purpose", ""))
+	cat = "escape" if purpose2 == "disengage" else "other"
+	if not bool(a["onset_prior_moving"]) or str(a["onset_prior_category"]) != cat:
+		onset_slots[side] = cat
+	a["onset_prior_moving"] = true
+	a["onset_prior_category"] = cat
+
+
+## Expanded four-body swept resolver: stable body order, actual-radius static clip, at most six
+## unordered pairs, earliest contact freezes ONLY contacting movers, at most four passes / 24
+## pair tests. No shoving and no unrelated-body clamp; no-progress is a visible failure.
+func _movement_cut_baby() -> void:
+	var bodies: Array = []
+	for i in 2:
+		var a: Dictionary = actors[i]
+		a["moved_this_boundary"] = false
+		if not bool(a["alive"]):
+			continue
+		var prior: Array = [float(a["x"]), float(a["y"])]
+		var want := 0.0
+		var poly: Array = [prior]
+		if bool(a["bound_active"]):
+			var step := float(content.skill("short_bound")["travel_mwu_per_tick"])
+			var remaining := float(a["bound_total"]) - float(a["bound_progress"])
+			want = minf(step, remaining)
+			if want > 0.0:
+				poly = _bound_polyline(a, want)
+		elif _movement_allowed(a):
+			if _advance_goal(a):
+				var goal: Variant = a["goal"]
+				if goal is Dictionary and str((goal as Dictionary).get("kind", "")) == "move":
+					var route: Array = (goal as Dictionary).get("route", [])
+					if not route.is_empty():
+						var tp: Array = route[int((goal as Dictionary).get("i", 0))]
+						var dx := float(tp[0]) - float(prior[0])
+						var dy := float(tp[1]) - float(prior[1])
+						var d := sqrt(dx * dx + dy * dy)
+						var speed := float(a["mov_mwu_per_s"]) / 60.0
+						if d > 0.001:
+							want = minf(speed, d)
+							poly = [prior, [float(prior[0]) + dx * (want / d),
+								float(prior[1]) + dy * (want / d)]]
+			else:
+				want = 0.0
+		poly = _clip_polyline_for(poly, float(a["radius"]))
+		bodies.append({"kind": "monster", "id": i, "prior": prior, "poly": poly,
+			"arcs": M01Arena.poly_arcs(poly), "intended": want,
+			"radius": float(a["radius"]), "bound": bool(a["bound_active"])})
+	for s in prey_slots.size():
+		var p: Dictionary = prey_slots[s]
+		p["moved_this_boundary"] = false
+		if not bool(p["live"]):
+			continue
+		var prior2: Array = [float(p["x"]), float(p["y"])]
+		var want2 := 0.0
+		var poly2: Array = [prior2]
+		if int(p["threat"]) >= 0 and not (p["route"] as Array).is_empty():
+			var speed2 := float(_baby()["prey"]["mov_mwu_per_s"]) / 60.0
+			want2 = speed2
+			poly2 = _route_polyline(prior2, p["route"], int(p["route_i"]), speed2)
+		poly2 = _clip_polyline_for(poly2, float(p["radius"]))
+		bodies.append({"kind": "prey", "id": s, "prior": prior2, "poly": poly2,
+			"arcs": M01Arena.poly_arcs(poly2), "intended": want2,
+			"radius": float(p["radius"]), "bound": false})
+
+	var n := bodies.size()
+	var stop: Array = []
+	var contact_stop: Array = []
+	var frozen: Array = []
+	for i in n:
+		stop.append(1.0)
+		contact_stop.append(false)
+		frozen.append(false)
+	var pass_i := 0
+	var tests := 0
+	while pass_i < BABY_MAX_PASSES:
+		var best := 2.0
+		var contacts: Array = []
+		for i in range(n):
+			for j in range(i + 1, n):
+				if tests >= BABY_MAX_PAIR_TESTS:
+					break
+				# R1: eligibility is based on REMAINING (unfrozen) movers. A frozen mover against an
+				# originally stationary body is a stopped/stopped pair, not an unresolved contact;
+				# stopped bodies still obstruct other continuing movers.
+				if bool(frozen[i]) and bool(frozen[j]):
+					continue
+				var mi := _body_moves(bodies[i]) and not bool(frozen[i])
+				var mj := _body_moves(bodies[j]) and not bool(frozen[j])
+				if not mi and not mj:
+					continue
+				tests += 1
+				var dist := float(bodies[i]["radius"]) + float(bodies[j]["radius"])
+				var res := M01Arena.earliest_contact_polyline_stopped(
+					bodies[i]["poly"], bodies[i]["arcs"], float(bodies[i]["intended"]),
+					float(stop[i]), bodies[j]["poly"], bodies[j]["arcs"],
+					float(bodies[j]["intended"]), float(stop[j]), dist)
+				if bool(res[1]):
+					var frac := float(res[0])
+					if frac < best - 1e-12:
+						best = frac
+						contacts = [[i, j]]
+					elif absf(frac - best) <= 1e-12:
+						contacts.append([i, j])
+		if contacts.is_empty():
+			break
+		var froze := false
+		for pair in contacts:
+			for member in pair:
+				var m := int(member)
+				if bool(frozen[m]) or not _body_moves(bodies[m]):
+					continue
+				stop[m] = minf(float(stop[m]), best)
+				contact_stop[m] = true
+				frozen[m] = true
+				froze = true
+		pass_i += 1
+		if not froze:
+			movement_contract_failures += 1
+			break
+	pair_test_total += tests
+
+	for bi in n:
+		var b: Dictionary = bodies[bi]
+		var f := float(stop[bi])
+		var applied := M01Arena.poly_point(b["poly"], b["arcs"], float(b["intended"]), f)
+		var arc_end := float((b["arcs"] as Array)[(b["arcs"] as Array).size() - 1])
+		var travelled := minf(f * float(b["intended"]), arc_end)
+		var px := float(applied[0])
+		var py := float(applied[1])
+		if str(b["kind"]) == "monster":
+			var a2: Dictionary = actors[int(b["id"])]
+			var prior3: Array = b["prior"]
+			a2["x"] = px
+			a2["y"] = py
+			a2["facing"] = _facing_for(prior3, applied, int(a2["facing"]))
+			var moved := sqrt(pow(px - float(prior3[0]), 2.0)
+				+ pow(py - float(prior3[1]), 2.0)) > 1e-9
+			if moved:
+				a2["moved_this_boundary"] = true
+				_capture_onset(a2, b)
+			if bool(a2["bound_active"]):
+				var progress_after := float(a2["bound_progress"]) + travelled
+				a2["bound_progress"] = progress_after
+				var unfinished := progress_after < float(a2["bound_total"]) - 1e-6
+				var travel_short := travelled < float(b["intended"]) - 1e-6
+				if travel_short or (bool(contact_stop[bi]) and unfinished):
+					var contact := bool(contact_stop[bi])
+					_obstruct_bound(a2, _bound_terminal_reason(bi, contact, f,
+						arc_end, float(b["intended"]), travel_short))
+				elif not unfinished:
+					_finish_bound(a2, "arrived")
+		else:
+			var p2: Dictionary = prey_slots[int(b["id"])]
+			var prior4: Array = b["prior"]
+			p2["x"] = px
+			p2["y"] = py
+			p2["facing"] = _facing_for(prior4, applied, int(p2["facing"]))
+			if sqrt(pow(px - float(prior4[0]), 2.0)
+					+ pow(py - float(prior4[1]), 2.0)) > 1e-9:
+				p2["moved_this_boundary"] = true
+			_advance_prey_cursor(p2, prior4, travelled)
+	for i in 2:
+		var ma: Dictionary = actors[i]
+		if not bool(ma["moved_this_boundary"]):
+			ma["onset_prior_moving"] = false
+			ma["onset_prior_category"] = ""
+
+
+## Prey sensing: nearest alive competing monster within threat range and LOS, tie side0.
+func _prey_sense(p: Dictionary) -> int:
+	var best := -1
+	var best_d := INF
+	var rng := float(_baby()["prey"]["threat_range_mwu"])
+	for i in 2:
+		if not bool(actors[i]["alive"]):
+			continue
+		var dx := float(actors[i]["x"]) - float(p["x"])
+		var dy := float(actors[i]["y"]) - float(p["y"])
+		var d2 := dx * dx + dy * dy
+		if d2 > rng * rng:
+			continue
+		if not arena.line_of_effect(float(p["x"]), float(p["y"]),
+				float(actors[i]["x"]), float(actors[i]["y"])):
+			continue
+		if d2 < best_d - 1e-9:
+			best_d = d2
+			best = i
+	return best
+
+
+## Prey planning on the existing 15-tick cadence: one bounded route tree per prey, choose the
+## reachable legal node with the greatest squared distance from the sensed threat (tie lower id),
+## then reconstruct ONE route. No RNG, no teleport, no relaxed limit.
+func _prey_plan_cut() -> void:
+	for s in prey_slots.size():
+		var p: Dictionary = prey_slots[s]
+		if not bool(p["live"]):
+			continue
+		var threat := _prey_sense(p)
+		p["threat"] = threat
+		if threat < 0:
+			p["route"] = []
+			p["route_i"] = 0
+			continue
+		p["threat_x"] = float(actors[threat]["x"])
+		p["threat_y"] = float(actors[threat]["y"])
+		if tick < int(p["next_plan_tick"]):
+			continue
+		_plan_prey_flee(p, threat)
+		p["next_plan_tick"] = tick + int(content.tuning["vision"]["planning_ticks"])
+
+
+func _plan_prey_flee(p: Dictionary, threat: int) -> void:
+	var from: Array = [float(p["x"]), float(p["y"])]
+	var tree := arena.build_route_tree(from)
+	prey_search_total += 1
+	var start_id := int(tree.get("start_id", -1))
+	if not bool(tree.get("ok", false)) or start_id < 0:
+		prey_violation_total += 1
+		return
+	var parent: Dictionary = tree.get("parent", {})
+	var exp := int(tree.get("expansions", 0))
+	prey_expansion_total += exp
+	if exp > int(M01MonsterBehavior.MAX_SEARCH_EXPANSIONS):
+		prey_violation_total += 1
+	var tx := float(p["threat_x"])
+	var ty := float(p["threat_y"])
+	var best_id := -1
+	var best_d2 := -1.0
+	for id in arena.legal_nodes:
+		if int(id) != start_id and not parent.has(int(id)):
+			continue
+		var c := arena.node_center(int(id))
+		var dx := float(c[0]) - tx
+		var dy := float(c[1]) - ty
+		var d2 := dx * dx + dy * dy
+		if d2 > best_d2 + 1e-9 \
+				or (absf(d2 - best_d2) <= 1e-9 and (best_id < 0 or int(id) < best_id)):
+			best_d2 = d2
+			best_id = int(id)
+	if best_id < 0:
+		prey_violation_total += 1
+		return
+	var route := arena.route_from_tree(tree, from, arena.node_center(best_id))
+	if route.is_empty():
+		prey_violation_total += 1
+		return
+	p["route"] = route
+	p["route_i"] = 0
+
+
 func _movement_cut() -> void:
+	if _is_baby():
+		_movement_cut_baby()
+		return
 	var prior := [[float(actors[0]["x"]), float(actors[0]["y"])],
 		[float(actors[1]["x"]), float(actors[1]["y"])]]
 	# R01/FIX01 (ARCH F01/QA F01): each actor proposes a time-parameterized piecewise trajectory
@@ -1856,6 +3136,12 @@ static func _facing_for(from: Array, to: Array, current: int) -> int:
 func _update_vision_and_search() -> void:
 	for i in 2:
 		var a: Dictionary = actors[i]
+		if _is_baby() and not bool(a["alive"]):
+			# A down observer has no live sensing and no stale search influence.
+			a["enemy_visible"] = false
+			a["memory_valid"] = false
+			a["search_active"] = false
+			continue
 		var enemy: Dictionary = actors[1 - i]
 		var was_visible := bool(a["enemy_visible"])
 		var visible := false
@@ -1887,6 +3173,37 @@ func _update_vision_and_search() -> void:
 			a["search_start"] = tick
 			a["search_deadline"] = tick + int(content.tuning["vision"]["search_ticks"])
 			telemetry.emit(tick, 17, [i, 0, int(a["memory_token"]), "start", int(a["search_deadline"]), "vision_loss"])
+	if _is_baby():
+		_update_prey_knowledge()
+
+
+## Bounded three-entry observer knowledge: the competitor compatibility view above plus two prey
+## entries. Frozen last-seen points are retained; a replacement life is never refreshed from
+## hidden coordinates and never targeted while unseen.
+func _update_prey_knowledge() -> void:
+	for i in 2:
+		var a: Dictionary = actors[i]
+		if not bool(a["alive"]):
+			continue
+		for s in prey_slots.size():
+			var k: Dictionary = (a["prey_knowledge"] as Array)[s]
+			var p: Dictionary = prey_slots[s]
+			var vis := bool(p["live"]) and _los_vision(a, [float(p["x"]), float(p["y"])])
+			if vis:
+				if int(k["life_id"]) != int(p["life_id"]):
+					k["life_id"] = int(p["life_id"])
+					k["token"] = int(k["token"]) + 1
+					k["visited"] = []
+				k["visible"] = true
+				k["x"] = float(p["x"])
+				k["y"] = float(p["y"])
+				k["last_seen_tick"] = tick
+				k["expiry"] = tick + int(content.tuning["vision"]["memory_ticks"])
+				k["memory_valid"] = true
+			else:
+				k["visible"] = false
+				if bool(k["memory_valid"]) and tick >= int(k["expiry"]):
+					k["memory_valid"] = false
 
 
 ## ARCH amendment (NPC ingress): a decision produced in cut6 survives _tick_start in the
@@ -1914,6 +3231,7 @@ func _drain_npc_submissions() -> void:
 			"sequence": int(q["sequence"]), "slot": int(q["slot"]) - 1,
 			"family": int(q["family"]), "target_kind": int(q["target_kind"]),
 			"target_or_area": q["target_or_area"], "observed_tick": int(q["observation_tick"]),
+			"source_life": int(q.get("source_life", -1)),
 		}
 		# G3 §8: revalidate against the last completed permitted boundary (tick - 1) and
 		# discard an obsolete hint rather than refreshing it from hidden coordinates.
@@ -2006,12 +3324,18 @@ func _npc_tick() -> void:
 				"target_or_area": hint[1],
 				"revalidated_observation_tick": int(decision["observation_tick"]),
 				"observation_category": observed_category,
+				"source_life": int(a["life_id"]),
 			}
 
 
 func _publish_public_actions() -> void:
 	for i in 2:
 		var a: Dictionary = actors[i]
+		var active_brace := int(a["brace_end"]) > tick and int(a["brace_start"]) >= 0 \
+				and tick > int(a["brace_start"])
+		if active_brace and not bool(a["onset_prior_brace"]):
+			onset_slots[i] = "active_defense"
+		a["onset_prior_brace"] = active_brace
 		var public := ""
 		if not bool(a["alive"]):
 			public = "ko"
@@ -2046,10 +3370,31 @@ func _emit_checkpoint() -> void:
 	telemetry.emit(tick, 21, [cid, sha, stream_draws.duplicate(true)])
 
 
+## Stable copied target/area value for the causal queue fingerprint (never a live reference).
+func _copy_target_value(v: Variant) -> Variant:
+	if v == null:
+		return null
+	if v is int:
+		return int(v)
+	if v is float:
+		return snappedf(v, 0.000001)
+	if v is Array and (v as Array).size() == 2:
+		var out: Array = []
+		for e in v as Array:
+			if e is int:
+				out.append(int(e))
+			elif e is float:
+				out.append(snappedf(float(e), 0.000001))
+			else:
+				out.append(str(e))
+		return out
+	return str(v)
+
+
 func canonical_state() -> Dictionary:
 	var acts := []
 	for a in actors:
-		acts.append({
+		var row := {
 			"id": int(a["actor_id"]),
 			"hp": int(a["hp"]),
 			"stam": int(a["stam"]),
@@ -2084,9 +3429,78 @@ func canonical_state() -> Dictionary:
 			"emotion": str(a["emotion"]),
 			"npc": {"queued": a["npc"]["queued"].duplicate(true) if a["npc"]["queued"] != null else null,
 				"next": int(a["npc"]["next_decision_tick"])},
-		})
-	return {"tick": tick, "actors": acts, "streams": stream_draws.duplicate(true),
+		}
+		if _is_baby():
+			row["life_id"] = int(a["life_id"])
+			row["lifecycle"] = str(a["lifecycle"])
+			row["return_due"] = int(a["return_due"])
+			row["selected_target"] = (a["selected_target"] as Dictionary).duplicate(true)
+			row["prey_knowledge"] = (a["prey_knowledge"] as Array).duplicate(true)
+			row["action"] = a["action"].duplicate(true) if a["action"] != null else null
+			row["goal"] = a["goal"].duplicate(true) if a["goal"] != null else null
+		acts.append(row)
+	var out := {"tick": tick, "actors": acts, "streams": stream_draws.duplicate(true),
 		"seed": str(root_seed), "mode": mode}
+	if _is_baby():
+		var effects: Array = []
+		for e in pending_effects:
+			var eref: Dictionary = {}
+			var etr: Variant = e.get("target_ref", {})
+			if etr is Dictionary:
+				eref = etr as Dictionary
+			effects.append({"effect": int(e.get("effect", 0)),
+				"impact_tick": int(e.get("impact_tick", -1)),
+				"action": int(e.get("action", 0)),
+				"source": int(e.get("source", -1)),
+				"source_life_id": int(e.get("source_life_id", -1)),
+				"source_atk": int(e.get("source_atk", -1)),
+				"base_power_cp": int(e.get("base_power_cp", -1)),
+				"interrupt_power": int(e.get("interrupt_power", -1)),
+				"kind": str(e.get("kind", "")),
+				"target_ref": eref.duplicate(true),
+				"target_life_id": int(e.get("target_life_id", -1)),
+				"qualification": str(e.get("qualification", ""))})
+		var prey_out: Array = []
+		for s in prey_slots.size():
+			var p: Dictionary = prey_slots[s]
+			prey_out.append({"slot": s, "life_id": int(p["life_id"]), "live": bool(p["live"]),
+				"hp": int(p["hp"]), "x": snappedf(float(p["x"]), 0.000001),
+				"y": snappedf(float(p["y"]), 0.000001), "facing": int(p["facing"]),
+				"respawn_due": int(p["respawn_due"]), "route_i": int(p["route_i"]),
+				"next_plan_tick": int(p["next_plan_tick"]),
+				"route": (p["route"] as Array).duplicate(true),
+				"threat": int(p["threat"]),
+				"credited": (p["credited"] as Array).duplicate(),
+				"first_credit": (p["first_credit"] as Array).duplicate()})
+		# Bounded copied gateway queue contents/identities in stable order (not a count only).
+		# R4: admission/meaning-changing fields, including the command hint and envelope.
+		var staged_copy: Array = []
+		for raw in gateway.staged:
+			staged_copy.append({"actor": int(raw.get("actor", -1)),
+				"trainer": int(raw.get("trainer", -1)),
+				"schema": str(raw.get("schema", "")),
+				"slot": int(raw.get("slot", -1)),
+				"sequence": int(raw.get("sequence", -1)),
+				"family": int(raw.get("family", -1)),
+				"target_kind": int(raw.get("target_kind", -1)),
+				"target_or_area": _copy_target_value(raw.get("target_or_area", null)),
+				"observed_tick": int(raw.get("observed_tick", -1)),
+				"effective_tick": int(raw.get("effective_tick", -1)),
+				"source_life": int(raw.get("source_life", -1))})
+		staged_copy.sort_custom(func(x, y):
+			if int(x["effective_tick"]) != int(y["effective_tick"]):
+				return int(x["effective_tick"]) < int(y["effective_tick"])
+			if int(x["sequence"]) != int(y["sequence"]):
+				return int(x["sequence"]) < int(y["sequence"])
+			return int(x["actor"]) < int(y["actor"]))
+		out["baby"] = {"progression": progression.duplicate(true), "prey": prey_out,
+			"pending_effects": effects, "gateway_staged": staged_copy,
+			"gateway_staged_count": gateway.staged.size(),
+			"pair_tests": pair_test_total, "placement_tests": placement_test_total,
+			"prey_expansions": prey_expansion_total,
+			"prey_violations": prey_violation_total,
+			"movement_contract_failures": movement_contract_failures}
+	return out
 
 
 func _end_encounter(reason: int, batch: int) -> void:
@@ -2098,8 +3512,145 @@ func _end_encounter(reason: int, batch: int) -> void:
 	telemetry.emit(tick, 20, [batch, reason, ko_actors.duplicate(), true])
 	if reason == 2:
 		_record("Sparring ended: diagnostic KO", "mutual KO", 0, "end")
-	else:
+	elif reason == 1:
 		_record("Sparring ended: diagnostic KO", "", 0, "end")
+	elif reason == 3:
+		_record("Sparring ended: time limit", "", 0, "end")
+	elif reason == 4:
+		_record("Sparring stopped", "", 0, "end")
+	else:
+		_record("Sparring ended: result unavailable", "", 0, "end")
+
+
+## Expanded Baby terminal end: no winner, empty terminal ko_actors, future schedules cancelled.
+func _end_encounter_baby(reason: int, batch: int) -> void:
+	if ended:
+		return
+	ended = true
+	end_reason = reason
+	end_batch = batch
+	ko_actors = []
+	for a in actors:
+		a["return_due"] = -1
+	for p in prey_slots:
+		p["respawn_due"] = -1
+	telemetry.emit(tick, 20, [batch, reason, [], true])
+	if reason == 3:
+		_record("Baby playtest complete", "", 0, "end")
+	elif reason == 4:
+		_record("Playtest stopped", "", 0, "end")
+	else:
+		_record("Baby playtest stopped: result unavailable", "", 0, "end")
+
+
+func schema_name() -> String:
+	return SCHEMA_EXPANDED if _is_baby() else SCHEMA
+
+
+func terminal_category() -> String:
+	if not ended:
+		return ""
+	if _is_baby():
+		if end_reason == 3:
+			return "baby_complete"
+		if end_reason == 4:
+			return "aborted"
+		return "incomplete"
+	match end_reason:
+		1:
+			if ko_actors.size() == 1 and int(ko_actors[0]) == 0:
+				return "own_down"
+			if ko_actors.size() == 1 and int(ko_actors[0]) == 1:
+				return "enemy_down"
+			return "incomplete"
+		2:
+			if ko_actors.size() == 2 and int(ko_actors[0]) != int(ko_actors[1]):
+				return "both_down"
+			return "incomplete"
+		3:
+			return "timeout"
+		4:
+			return "aborted"
+	return "incomplete"
+
+
+func _enemy_sample(observer: int) -> Dictionary:
+	var own: Dictionary = actors[observer]
+	var enemy: Dictionary = actors[1 - observer]
+	var state := M01Observations.visibility_state(own, tick)
+	var out := {"knowledge": state, "position": null, "facing": null, "life_id": null,
+		"action": "", "performed_onset": "", "last_known_position": null,
+		"hp_band": -1, "last_seen_tick": -1}
+	if state == 2:
+		out["position"] = [float(enemy["x"]), float(enemy["y"])]
+		out["facing"] = int(enemy["facing"])
+		out["life_id"] = int(enemy["life_id"])
+		out["action"] = str(enemy.get("public_action", ""))
+		out["performed_onset"] = str(onset_slots.get(1 - observer, ""))
+		out["hp_band"] = M01Observations.hp_band(int(enemy["hp"]), int(enemy["hp_max"]))
+		out["last_seen_tick"] = tick
+	elif state == 1:
+		out["last_known_position"] = [float(own["memory_x"]), float(own["memory_y"])]
+		out["hp_band"] = int(own["memory_hp_band"])
+		out["last_seen_tick"] = int(own["memory_last_seen_tick"])
+	return out
+
+
+func _visible_prey_samples(observer: int) -> Array:
+	var out: Array = []
+	if not _is_baby():
+		return out
+	var a: Dictionary = actors[observer]
+	if not bool(a["alive"]):
+		return out
+	for s in prey_slots.size():
+		var p: Dictionary = prey_slots[s]
+		if not bool(p["live"]) or not _prey_visible_to(a, s):
+			continue
+		out.append({"slot": s, "life_id": int(p["life_id"]),
+			"x": float(p["x"]), "y": float(p["y"]), "facing": int(p["facing"]),
+			"moving": bool(p["moved_this_boundary"])})
+		if out.size() >= 2:
+			break
+	return out
+
+
+func _nest_copy() -> Array:
+	if not _is_baby():
+		return []
+	var sec := _baby()
+	var out: Array = []
+	for i in 2:
+		var c: Array = (sec["nests"]["centers"] as Array)[i]
+		out.append({"side": i, "x": float(c[0]), "y": float(c[1]),
+			"radius": float(sec["nests"]["radius_mwu"])})
+	return out
+
+
+## Fixed observer-0 public projection for presentation. Copies already-captured values only;
+## reading it neither consumes an onset nor reveals hidden positions.
+func presentation_view_for_human() -> Dictionary:
+	var own: Dictionary = actors[0]
+	var status := "alive"
+	if _is_baby() and not bool(own["alive"]):
+		status = "waiting_return" if int(own["return_due"]) >= 0 \
+			and tick >= int(own["return_due"]) else "down"
+	return {
+		"schema": schema_name(),
+		"mode": mode,
+		"tick": tick,
+		"terminal_category": terminal_category(),
+		"own": {"side": 0, "life_id": int(own["life_id"]), "status": status,
+			"position": [float(own["x"]), float(own["y"])], "facing": int(own["facing"]),
+			"action": str(own.get("public_action", "")),
+			"performed_onset": str(onset_slots.get(0, "")),
+			"growth_tick": int(own.get("growth_notice_tick", -1)),
+			"return_tick": int(own.get("return_notice_tick", -1))},
+		"enemy": _enemy_sample(0),
+		"prey": _visible_prey_samples(0),
+		"nests": _nest_copy(),
+		"layout": _map_copy(),
+	}
 
 
 func summary() -> Dictionary:
@@ -2112,8 +3663,10 @@ func summary() -> Dictionary:
 	var hits := int(telemetry.type_counts.get(11, 0))
 	var kos := int(telemetry.type_counts.get(19, 0))
 	var reason_name := {1: "single_ko", 2: "mutual_ko", 3: "diagnostic_timeout", 4: "aborted"}
-	return {
-		"schema": SCHEMA,
+	if _is_baby():
+		reason_name = {3: "baby_complete", 4: "aborted"}
+	var out := {
+		"schema": schema_name(),
 		"mode": mode,
 		"fixture_id": fixture_id,
 		"root_seed": str(root_seed),
@@ -2146,6 +3699,29 @@ func summary() -> Dictionary:
 		"queue_peak": telemetry.queue_peak,
 		"event_bytes": telemetry.event_bytes_total,
 	}
+	if _is_baby():
+		out["terminal_category"] = terminal_category()
+		out["life_ids"] = [int(actors[0]["life_id"]), int(actors[1]["life_id"])]
+		out["lifecycle"] = [str(actors[0]["lifecycle"]), str(actors[1]["lifecycle"])]
+		out["return_due"] = [int(actors[0]["return_due"]), int(actors[1]["return_due"])]
+		out["progression"] = progression.duplicate(true)
+		var prey_out: Array = []
+		for s in prey_slots.size():
+			var p: Dictionary = prey_slots[s]
+			prey_out.append({"slot": s, "life_id": int(p["life_id"]), "live": bool(p["live"]),
+				"hp": int(p["hp"]), "x": snappedf(float(p["x"]), 0.000001),
+				"y": snappedf(float(p["y"]), 0.000001), "respawn_due": int(p["respawn_due"]),
+				"credited": (p["credited"] as Array).duplicate(),
+				"first_credit": (p["first_credit"] as Array).duplicate(),
+				"route_cursor": int(p["route_i"]), "next_plan_tick": int(p["next_plan_tick"])})
+		out["prey"] = prey_out
+		out["baby_work"] = {"pair_tests": pair_test_total,
+			"placement_tests": placement_test_total,
+			"prey_searches": prey_search_total,
+			"prey_expansions": prey_expansion_total,
+			"prey_violations": prey_violation_total,
+			"movement_contract_failures": movement_contract_failures}
+	return out
 
 
 func observe_for(observer: int) -> Dictionary:
@@ -2156,15 +3732,20 @@ func observe_for(observer: int) -> Dictionary:
 			"tick": int(actors[observer]["memory_last_seen_tick"]),
 			"hp_band": int(actors[observer]["memory_hp_band"]),
 			"form": str(actors[observer]["memory_form"])}
-	return M01Observations.build_trainer_observation(observer, tick,
-		[actors[observer], actors[enemy]], enemy, _map_copy(), mem)
+	# Canonical actors0/1 order: build_trainer_observation indexes its own array by the global
+	# observer index, which previously swapped observer1's own/enemy views.
+	return M01Observations.build_trainer_observation(observer, tick, actors, enemy,
+		_map_copy(), mem)
 
 
 func _map_copy() -> Dictionary:
+	var spawn_copy := arena.spawn.duplicate(true)
+	if _is_baby():
+		spawn_copy = (_baby()["nests"]["centers"] as Array).duplicate(true)
 	return {
 		"width": int(arena.width), "height": int(arena.height),
 		"blocker": [int(arena.original_blocker()[0]), int(arena.original_blocker()[1]),
 			int(arena.original_blocker()[2]), int(arena.original_blocker()[3])],
-		"spawn": arena.spawn.duplicate(true),
+		"spawn": spawn_copy,
 		"patrol": arena.patrol.duplicate(true),
 	}

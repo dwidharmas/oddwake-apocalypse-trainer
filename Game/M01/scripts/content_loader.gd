@@ -30,9 +30,12 @@ var compiled := {
 	"charge_ticks": {},
 	"cooldown_ticks": {},
 	"recovery_ticks": {},
+	"baby_prey_respawn_ticks": 0,
+	"baby_return_ticks": 0,
+	"baby_diagnostic_ticks": 0,
 }
-
-
+## Additive expanded-Baby section, compiled once at load. Empty for legacy content.
+var baby_growth := {}
 static func _read_bytes(path: String) -> PackedByteArray:
 	if not FileAccess.file_exists(path):
 		return PackedByteArray()
@@ -118,6 +121,7 @@ func load_from_disk() -> bool:
 	_validate_skills(skills_doc)
 	_validate_arena()
 	_validate_tuning()
+	_validate_baby_growth()
 
 	if errors.is_empty():
 		_compile()
@@ -261,6 +265,171 @@ func _validate_tuning() -> void:
 				_err("tuning.response", "missing '%s'" % f)
 
 
+## The selected expanded mode REQUIRES its section and a positive damage constant; missing
+## expanded content fails truthfully at load instead of a later dictionary/division failure.
+func _validate_baby_growth() -> void:
+	if not tuning.has("baby_growth_revival"):
+		_err("tuning.baby_growth_revival",
+			"required expanded-Baby section is missing for the default baby_growth_revival mode")
+		baby_growth = {}
+		return
+	if int(species.get("k_defense", 0)) <= 0:
+		_err("species", "k_defense must be positive before prey DEF0 damage uses k/(k+DEF)")
+	var raw: Variant = tuning["baby_growth_revival"]
+	if not (raw is Dictionary):
+		_err("tuning.baby_growth_revival", "section must be an object")
+		return
+	var sec := raw as Dictionary
+	var prey: Variant = sec.get("prey", null)
+	var nests: Variant = sec.get("nests", null)
+	if not (prey is Dictionary):
+		_err("tuning.baby_growth_revival.prey", "missing object")
+		return
+	if not (nests is Dictionary):
+		_err("tuning.baby_growth_revival.nests", "missing object")
+		return
+	var p := prey as Dictionary
+	var n := nests as Dictionary
+	var ok := true
+	for f in ["radius_mwu", "hp_max_cp", "def", "mov_mwu_per_s", "threat_range_mwu", "respawn_ms"]:
+		if not _integral_field(p, f, "tuning.baby_growth_revival.prey"):
+			ok = false
+	for f in ["radius_mwu", "return_ms"]:
+		if not _integral_field(n, f, "tuning.baby_growth_revival.nests"):
+			ok = false
+	if not _integral_field(sec, "diagnostic_ms", "tuning.baby_growth_revival"):
+		ok = false
+	if not ok:
+		return
+	if int(p["radius_mwu"]) <= 0 or int(p["hp_max_cp"]) <= 0 \
+			or int(p["mov_mwu_per_s"]) <= 0 or int(p["threat_range_mwu"]) <= 0 \
+			or int(p["respawn_ms"]) <= 0:
+		_err("tuning.baby_growth_revival.prey", "radius/hp/speed/threat/respawn must be positive")
+	if int(p["def"]) < 0:
+		_err("tuning.baby_growth_revival.prey", "def must be nonnegative")
+	if int(n["radius_mwu"]) <= 0 or int(n["return_ms"]) <= 0:
+		_err("tuning.baby_growth_revival.nests", "radius and return_ms must be positive")
+	if int(sec["diagnostic_ms"]) <= 0:
+		_err("tuning.baby_growth_revival", "diagnostic_ms must be positive")
+	if int(p.get("slots", 0)) != 2:
+		_err("tuning.baby_growth_revival.prey", "slots must be exactly 2")
+	if not _two_points(p.get("centers", null), "tuning.baby_growth_revival.prey"):
+		ok = false
+	if not _two_points(n.get("centers", null), "tuning.baby_growth_revival.nests"):
+		ok = false
+	var rings: Variant = sec.get("placement_ring_radii_mwu", null)
+	if not (rings is Array) or (rings as Array).size() != 2:
+		_err("tuning.baby_growth_revival", "placement_ring_radii_mwu must list exactly 2 radii")
+	elif not _integral_value((rings as Array)[0]) or not _integral_value((rings as Array)[1]) \
+			or int((rings as Array)[0]) <= 0 or int((rings as Array)[1]) <= 0:
+		_err("tuning.baby_growth_revival", "placement ring radii must be positive integers")
+	var rewards: Variant = sec.get("rewards", null)
+	if not (rewards is Array) or (rewards as Array).size() != 2:
+		_err("tuning.baby_growth_revival", "rewards must list exactly 2 entries")
+		return
+	for i in 2:
+		var rec: Variant = (rewards as Array)[i]
+		if not (rec is Dictionary):
+			_err("tuning.baby_growth_revival.rewards[%d]" % i, "entry must be an object")
+			ok = false
+			continue
+		var r := rec as Dictionary
+		for f in ["pending_atk", "evolution_exp"]:
+			if not _integral_field(r, f, "tuning.baby_growth_revival.rewards[%d]" % i):
+				ok = false
+			elif int(r[f]) < 0:
+				_err("tuning.baby_growth_revival.rewards[%d]" % i,
+					"field '%s' must be nonnegative" % f)
+				ok = false
+	if not ok:
+		return
+	_validate_baby_footprints(p, n)
+	if not errors.is_empty():
+		return
+	baby_growth = sec.duplicate(true)
+
+
+## Reference coordinates must fit the actual arena geometry at their own radius. Failure is a
+## truthful load error, never a silent teleport to another point.
+func _validate_baby_footprints(p: Dictionary, n: Dictionary) -> void:
+	var r_prey := float(int(p["radius_mwu"]))
+	var r_body := float(int(arena.get("body_radius_mwu", 500)))
+	for i in 2:
+		var c: Array = (p["centers"] as Array)[i]
+		if not _footprint_clear(float(c[0]), float(c[1]), r_prey):
+			_err("tuning.baby_growth_revival.prey.centers[%d]" % i,
+				"prey center %s does not fit arena/static geometry at radius %d" % [str(c), int(r_prey)])
+	for i in 2:
+		var c: Array = (n["centers"] as Array)[i]
+		if not _footprint_clear(float(c[0]), float(c[1]), r_body):
+			_err("tuning.baby_growth_revival.nests.centers[%d]" % i,
+				"nest/spawn center %s does not fit arena/static geometry at radius %d" % [str(c), int(r_body)])
+
+
+## Circle-vs-arena-rectangle and circle-vs-original-blocker clearance at an explicit radius.
+func _footprint_clear(x: float, y: float, radius: float) -> bool:
+	var w := float(int(arena.get("width_mwu", 0)))
+	var h := float(int(arena.get("height_mwu", 0)))
+	if w <= 0.0 or h <= 0.0:
+		return false
+	if x - radius < 0.0 or x + radius > w or y - radius < 0.0 or y + radius > h:
+		return false
+	var bx0 := float(int(arena.get("blocker_min_x", 0)))
+	var bx1 := float(int(arena.get("blocker_max_x", 0)))
+	var by0 := float(int(arena.get("blocker_min_y", 0)))
+	var by1 := float(int(arena.get("blocker_max_y", 0)))
+	if x + radius > bx0 and x - radius < bx1 and y + radius > by0 and y - radius < by1:
+		return false
+	return true
+
+
+## A finite integral (int, or float with no fractional part) numeric field.
+func _integral_value(v: Variant) -> bool:
+	if v is int:
+		return true
+	if v is float:
+		if is_nan(v) or is_inf(v):
+			return false
+		return absf(v - roundf(v)) <= 1e-9
+	return false
+
+
+func _integral_field(rec: Dictionary, field: String, where: String) -> bool:
+	if not rec.has(field):
+		_err(where, "missing required field '%s'" % field)
+		return false
+	if not _integral_value(rec[field]):
+		_err(where, "field '%s' must be a finite integral number, got %s" % [field, str(rec[field])])
+		return false
+	return true
+
+
+func _two_points(v: Variant, where: String) -> bool:
+	if not (v is Array) or (v as Array).size() != 2:
+		_err(where, "centers must list exactly 2 points")
+		return false
+	var seen := {}
+	for i in 2:
+		var pt: Variant = (v as Array)[i]
+		if not (pt is Array) or (pt as Array).size() != 2:
+			_err(where, "center[%d] must be a 2-number point" % i)
+			return false
+		for c in pt as Array:
+			if not _integral_value(c):
+				_err(where, "center[%d] must contain finite integral coordinates" % i)
+				return false
+		var key := "%d,%d" % [int((pt as Array)[0]), int((pt as Array)[1])]
+		if seen.has(key):
+			_err(where, "centers must be unique")
+			return false
+		seen[key] = true
+	return true
+
+
+func baby_section() -> Dictionary:
+	return baby_growth
+
+
 func _compile() -> void:
 	compiled["charge_ticks"] = {}
 	compiled["cooldown_ticks"] = {}
@@ -270,6 +439,10 @@ func _compile() -> void:
 		compiled["charge_ticks"][id] = _ms_to_ticks(int(d["charge_ms"]))
 		compiled["cooldown_ticks"][id] = _ms_to_ticks(int(d["cooldown_ms"]))
 		compiled["recovery_ticks"][id] = _ms_to_ticks(int(d["recovery_ms"]))
+	if not baby_growth.is_empty():
+		compiled["baby_prey_respawn_ticks"] = _ms_to_ticks(int(baby_growth["prey"]["respawn_ms"]))
+		compiled["baby_return_ticks"] = _ms_to_ticks(int(baby_growth["nests"]["return_ms"]))
+		compiled["baby_diagnostic_ticks"] = _ms_to_ticks(int(baby_growth["diagnostic_ms"]))
 
 
 func charge_ticks(id: String) -> int:

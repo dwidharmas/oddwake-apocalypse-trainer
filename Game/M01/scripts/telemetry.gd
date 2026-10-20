@@ -2,13 +2,14 @@ class_name M01Telemetry
 extends RefCounted
 
 const SCHEMA := "m01.1"
+const SCHEMA_EXPANDED := "m01.2"
 const TYPE_NAMES := {
 	1: "REQUEST", 2: "REJECT", 3: "RESPONSE", 4: "PRESSURE", 5: "PLAN",
 	6: "ACTION_START", 7: "COST", 8: "DUE", 9: "COMMIT", 10: "CANCEL",
 	11: "IMPACT", 12: "DAMAGE", 13: "HEAL", 14: "RESOURCE_BAND", 15: "BRACE",
 	16: "VISION", 17: "SEARCH", 18: "CONTROL", 19: "KO", 20: "ENCOUNTER_END",
 	21: "CHECKPOINT", 22: "LIFECYCLE", 23: "NPC_DECISION", 24: "NPC_SUBMISSION",
-	25: "PHYSICAL_LOCK", 26: "BOUND_TRAVEL",
+	25: "PHYSICAL_LOCK", 26: "BOUND_TRAVEL", 27: "BABY_LIFECYCLE", 28: "HUNT_REWARD",
 }
 
 const DICTIONARIES := {
@@ -33,6 +34,9 @@ const DICTIONARIES := {
 		"obstructed", "target_lost", "technique_unavailable", "recovering", "not_ready",
 		"guarding", "can_move_again", "authority_locked"],
 	"reject_reason": ["ownership", "control", "life", "sequence", "slot", "hint", "envelope"],
+	"entity_ids": {"0": "monster0", "1": "monster1", "2": "prey0", "3": "prey1"},
+	"baby_transition": ["monster_down", "return_wait", "monster_return", "prey_depleted",
+		"spawn_wait", "prey_spawn"],
 }
 
 var header := {}
@@ -54,6 +58,7 @@ var prepared_bytes: PackedByteArray = PackedByteArray()
 var notes: Array[String] = []
 
 var event_bytes_total := 0
+var schema := SCHEMA
 var active_window_start_tick := -1
 var active_bytes_window := 0
 var active_events_window := 0
@@ -96,8 +101,9 @@ func reset() -> void:
 
 
 func build_header(setup: Dictionary) -> void:
+	schema = str(setup.get("schema", SCHEMA))
 	header = {
-		"schema": SCHEMA,
+		"schema": schema,
 		"kind": "header",
 		"mode": setup.get("mode", "live"),
 		"fixture_id": setup.get("fixture_id", null),
@@ -120,6 +126,14 @@ func build_header(setup: Dictionary) -> void:
 			"pressure": "thirtieths", "fatigue": "centi", "mitigation": "bp10000"},
 		"ticks": setup.get("compiled_ticks", {}),
 	}
+	if schema == SCHEMA_EXPANDED:
+		header["entity_map"] = DICTIONARIES["entity_ids"]
+		header["target_ref"] = {"encoding": "0/1 monster, 2/3 prey",
+			"fields": ["kind", "id", "life_id"]}
+		header["event_definitions"] = {
+			"27": "BABY_LIFECYCLE[transition,entity,old_life,new_life,due,position,batch]",
+			"28": "HUNT_REWARD[slot,prey_life,winner,lifetime_damage,first_positive,group_damage,group_allocated,ordinal,atk_delta,exp_delta,cum_atk,cum_exp]",
+		}
 	lines.append(JSON.stringify(header))
 
 
@@ -183,7 +197,7 @@ func note(msg: String) -> void:
 func close_footer(summary: Dictionary, complete: bool) -> void:
 	capture_complete = capture_complete and complete and not overflowed and not writer_error
 	footer = {
-		"schema": SCHEMA,
+		"schema": schema,
 		"kind": "footer",
 		"last_sequence": sequence - 1,
 		"last_tick": last_tick,
@@ -262,7 +276,7 @@ static func canonical_state_sha256(state: Dictionary) -> String:
 
 
 static func decode_bundle(text: String) -> Dictionary:
-	var result := {"ok": false, "header": null, "events": [], "footer": null, "errors": []}
+	var result := {"ok": false, "schema": "", "header": null, "events": [], "footer": null, "errors": []}
 	var parts := text.split("\n")
 	var first := true
 	for raw in parts:
@@ -283,6 +297,211 @@ static func decode_bundle(text: String) -> Dictionary:
 			(result["events"] as Array).append(parsed)
 		else:
 			(result["errors"] as Array).append("unexpected line shape")
+	var header: Variant = result["header"]
+	var footer: Variant = result["footer"]
+	if not (header is Dictionary):
+		(result["errors"] as Array).append("missing header")
+		return result
+	var header_schema := str((header as Dictionary).get("schema", ""))
+	result["schema"] = header_schema
+	if header_schema != SCHEMA and header_schema != SCHEMA_EXPANDED:
+		(result["errors"] as Array).append("unsupported schema '%s'" % header_schema)
+		return result
+	if header_schema == SCHEMA_EXPANDED and not (header as Dictionary).has("entity_map"):
+		(result["errors"] as Array).append("expanded header missing entity_map")
+	if not (footer is Dictionary):
+		(result["errors"] as Array).append("missing footer")
+		return result
+	if str((footer as Dictionary).get("schema", "")) != header_schema:
+		(result["errors"] as Array).append("footer/header schema mismatch")
+	var expanded := header_schema == SCHEMA_EXPANDED
+	if expanded:
+		var em: Variant = (header as Dictionary).get("entity_map", null)
+		var expected_map := {"0": "monster0", "1": "monster1", "2": "prey0", "3": "prey1"}
+		if not (em is Dictionary) or (em as Dictionary).size() != 4:
+			(result["errors"] as Array).append("expanded header entity_map is not the fixed 4-entry map")
+		else:
+			for k in expected_map:
+				if str((em as Dictionary).get(k, "")) != str(expected_map[k]):
+					(result["errors"] as Array).append("expanded entity_map entry %s is not %s" % [
+						k, expected_map[k]])
+	for ev in result["events"] as Array:
+		var type_raw: Variant = (ev as Array)[2]
+		if not _exact_int(type_raw):
+			(result["errors"] as Array).append("non-integral event type %s" % str(type_raw))
+			continue
+		var type_id := int(type_raw)
+		if not TYPE_NAMES.has(type_id):
+			(result["errors"] as Array).append("unsupported event type %d" % type_id)
+			continue
+		if not expanded and type_id > 26:
+			(result["errors"] as Array).append("m01.1 bundle carries expanded event %d" % type_id)
+			continue
+		if expanded and not _expanded_shape_ok(type_id, (ev as Array)[3]):
+			(result["errors"] as Array).append("unsupported %s shape" % TYPE_NAMES[type_id])
 	if result["header"] != null and result["footer"] != null and (result["errors"] as Array).is_empty():
 		result["ok"] = true
 	return result
+
+
+## R3: JSON numbers arrive as floats. Accept only EXACT finite integrals within the supported
+## conversion range, then normalize; no epsilon acceptance and no fractional truncation.
+static func _num(v: Variant) -> bool:
+	return v is int or (v is float and not is_nan(v) and not is_inf(v))
+
+
+static func _exact_int(v: Variant) -> bool:
+	if v is int:
+		return true
+	if v is float:
+		if is_nan(v) or is_inf(v):
+			return false
+		if absf(v) > 9007199254740992.0:
+			return false
+		return float(int(v)) == v
+	return false
+
+
+static func _intlike(v: Variant) -> bool:
+	return _exact_int(v)
+
+
+static func _posint(v: Variant) -> bool:
+	return _exact_int(v) and int(v) > 0
+
+
+static func _nonnegint(v: Variant) -> bool:
+	return _exact_int(v) and int(v) >= 0
+
+
+static func _in_set(v: Variant, allowed: Array) -> bool:
+	if not _exact_int(v):
+		return false
+	return allowed.has(int(v))
+
+
+static func _entity(v: Variant) -> bool:
+	return _exact_int(v) and int(v) >= 0 and int(v) <= 3
+
+
+static func _monster_entity(v: Variant) -> bool:
+	return _exact_int(v) and (int(v) == 0 or int(v) == 1)
+
+
+static func _prey_entity(v: Variant) -> bool:
+	return _exact_int(v) and (int(v) == 2 or int(v) == 3)
+
+
+static func _pair_finite(v: Variant) -> bool:
+	if v == null:
+		return true
+	if not (v is Array) or (v as Array).size() != 2:
+		return false
+	return _num((v as Array)[0]) and _num((v as Array)[1])
+
+
+static func _pair_int2(v: Variant, minv: int) -> bool:
+	if v == null:
+		return false
+	if not (v is Array) or (v as Array).size() != 2:
+		return false
+	return _exact_int((v as Array)[0]) and _exact_int((v as Array)[1]) \
+		and int((v as Array)[0]) >= minv and int((v as Array)[1]) >= minv
+
+
+static func _pair_int_or_null2(v: Variant, minv: int) -> bool:
+	if not (v is Array) or (v as Array).size() != 2:
+		return false
+	for e in v as Array:
+		if e == null:
+			continue
+		if not _exact_int(e) or int(e) < minv:
+			return false
+	return true
+
+
+## Expanded event shapes are explicit: fixed entity mapping, per-event entity kinds, exact
+## integral generations and transition/nullability relationships. Unrecognized combinations are
+## never accepted as valid evidence.
+static func _expanded_shape_ok(type_id: int, payload: Variant) -> bool:
+	if not (payload is Array):
+		return false
+	var p := payload as Array
+	match type_id:
+		6:
+			# 9 fields; actor is a monster; Quick's entity target needs a positive generation.
+			if p.size() != 9 or not _monster_entity(p[1]):
+				return false
+			var sid := str(p[4])
+			if sid == "quick_claw":
+				if not _entity(p[5]) or not _posint(p[8]):
+					return false
+			elif sid == "brace":
+				if p[5] != null or p[8] != null:
+					return false
+			elif sid == "short_bound":
+				if not (p[5] is Array) or p[8] != null:
+					return false
+			else:
+				if p[8] != null:
+					return false
+			return p[5] == null or _entity(p[5]) or _pair_finite(p[5])
+		11:
+			# 8 fields; target entity; valid hit needs a positive generation.
+			if p.size() != 8 or not _entity(p[3]) or not _monster_entity(p[2]):
+				return false
+			var st := str(p[5])
+			if st == "hit":
+				return _posint(p[4])
+			if st != "blocked" and st != "invalid_life":
+				return false
+			return p[4] == null or _posint(p[4])
+		12:
+			# 11 fields; target entity; target life positive; prey credit nullable pair.
+			return p.size() == 11 and _entity(p[1]) and _posint(p[9]) \
+				and (p[10] == null or _pair_int2(p[10], 0))
+		19:
+			return p.size() == 4 and _monster_entity(p[0]) and _posint(p[1])
+		27:
+			if p.size() != 7 or not (p[0] is String) \
+					or not (DICTIONARIES["baby_transition"] as Array).has(str(p[0])):
+				return false
+			var tr := str(p[0])
+			# S1: explicit mapping of every released transition to its entity class, including
+			# the two wait names that carry neither a monster_/prey_ prefix.
+			var monster_tr := ["monster_down", "return_wait", "monster_return"]
+			var prey_tr := ["prey_depleted", "spawn_wait", "prey_spawn"]
+			if monster_tr.has(tr):
+				if not _monster_entity(p[1]):
+					return false
+			elif prey_tr.has(tr):
+				if not _prey_entity(p[1]):
+					return false
+			else:
+				return false
+			if not _posint(p[2]) or not _posint(p[3]):
+				return false
+			var needs_due := tr in ["monster_down", "prey_depleted", "return_wait", "spawn_wait"]
+			var needs_pos := tr in ["monster_down", "prey_depleted", "monster_return", "prey_spawn"]
+			if needs_due:
+				if not _posint(p[4]):
+					return false
+			elif p[4] != null:
+				return false
+			if needs_pos:
+				if not (p[5] is Array) or not _pair_finite(p[5]):
+					return false
+			elif p[5] != null:
+				return false
+			return p[6] == null or _intlike(p[6])
+		28:
+			return p.size() == 12 and _in_set(p[0], [0, 1]) and _posint(p[1]) \
+				and (p[2] == null or _in_set(p[2], [0, 1])) \
+				and _pair_int2(p[3], 0) \
+				and _pair_int_or_null2(p[4], 0) \
+				and _pair_int2(p[5], 0) and _pair_int2(p[6], 0) \
+				and (p[7] == null or _in_set(p[7], [1, 2, 3])) \
+				and _nonnegint(p[8]) and _nonnegint(p[9]) \
+				and (p[10] == null or _nonnegint(p[10])) \
+				and (p[11] == null or _nonnegint(p[11]))
+	return true

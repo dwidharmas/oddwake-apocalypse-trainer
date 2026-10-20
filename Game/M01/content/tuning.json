@@ -1,7 +1,7 @@
 {
   "schema": "m01.1",
   "id": "tuning.m01",
-  "revision": "1",
+  "revision": "2",
   "tick_rate": 60,
   "root_seed_default": 3101,
   "timeout_active_ticks": 10800,
@@ -130,5 +130,29 @@
     "total": 8,
     "filled": [1, 2, 3],
     "labels": ["Attack", "Defense", "Run", "Empty", "Empty", "Empty", "Empty", "Empty"]
+  },
+  "baby_growth_revival": {
+    "revision": "1",
+    "prey": {
+      "slots": 2,
+      "centers": [[6000, 6000], [14000, 6000]],
+      "radius_mwu": 250,
+      "hp_max_cp": 2400,
+      "def": 0,
+      "mov_mwu_per_s": 1600,
+      "threat_range_mwu": 2500,
+      "respawn_ms": 15000
+    },
+    "nests": {
+      "centers": [[2000, 10000], [18000, 2000]],
+      "radius_mwu": 1000,
+      "return_ms": 5000
+    },
+    "diagnostic_ms": 90000,
+    "placement_ring_radii_mwu": [1000, 2000],
+    "rewards": [
+      {"pending_atk": 2, "evolution_exp": 10},
+      {"pending_atk": 1, "evolution_exp": 5}
+    ]
   }
 }

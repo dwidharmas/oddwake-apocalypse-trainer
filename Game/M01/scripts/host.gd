@@ -49,7 +49,7 @@ var browser_identity := ""
 var engine_identity := ""
 var build_id := "mm-m01-r01"
 var root_seed := 3101
-var mode := "live"
+var mode := "baby_growth_revival"
 var fixture := {}
 var restart_count := 0
 var cue_events: Array = []
@@ -57,6 +57,8 @@ var frame_counter := 0
 var presentation: M01Presentation = null
 var stage_mono_queue: Array = []
 var stage_request_queue: Array = []
+var last_own_life_id := -1
+var last_own_alive := true
 
 
 func _ready() -> void:
@@ -82,7 +84,11 @@ func _ready() -> void:
 func _reset_run() -> void:
 	telemetry.reset()
 	sim = M01Simulation.new()
-	sim.setup(content, arena, telemetry, mode, root_seed, fixture)
+	var setup_ok := sim.setup(content, arena, telemetry, mode, root_seed, fixture)
+	if not setup_ok:
+		content_error = "Selected mode '%s' could not start: required content is missing or invalid." % mode
+		push_error("M01 setup failed:\n" + content_error)
+		return
 	input_sequence = {0: 0, 1: 0}
 	accumulator = 0.0
 	paused = true
@@ -96,6 +102,13 @@ func _reset_run() -> void:
 	frame_ms_samples.clear()
 	cue_events.clear()
 	frame_counter = 0
+	held_keys.clear()
+	stage_mono_queue.clear()
+	stage_request_queue.clear()
+	last_own_life_id = int(sim.actors[0]["life_id"])
+	last_own_alive = bool(sim.actors[0]["alive"])
+	if presentation != null and sim.has_signal("public_quick_release"):
+		sim.public_quick_release.connect(presentation.on_quick_release)
 	_build_header()
 	telemetry.emit(0, 22, ["pause", "reset"])
 	lifecycle_changed.emit(true, "reset")
@@ -114,7 +127,18 @@ func _build_header() -> void:
 			"instinct": int(a["instinct"]), "bond": int(a["bond"]),
 			"fatigue_centi": int(a["fatigue_centi"]),
 		})
+	var initial_state := {"actors": initial, "diagnostic_effects": fixture.get("arriving_effects", [])}
+	if sim.is_expanded():
+		var prey_init: Array = []
+		for p in sim.prey_slots:
+			prey_init.append({"slot": int(p["slot"]), "life_id": int(p["life_id"]),
+				"hp": int(p["hp"]), "x": snappedf(float(p["x"]), 0.000001),
+				"y": snappedf(float(p["y"]), 0.000001), "live": bool(p["live"])})
+		initial_state["prey"] = prey_init
+		initial_state["progression"] = sim.progression.duplicate(true)
+		initial_state["nests"] = sim.presentation_view_for_human().get("nests", [])
 	telemetry.build_header({
+		"schema": sim.schema_name(),
 		"mode": mode,
 		"fixture_id": sim.fixture_id if sim.fixture_id != "" else null,
 		"engine": engine_identity,
@@ -128,7 +152,7 @@ func _build_header() -> void:
 		"root_seed": str(root_seed),
 		"stream_seeds": streams_info,
 		"stream_draw_counts": sim.stream_draws.duplicate(true),
-		"initial_state": {"actors": initial, "diagnostic_effects": fixture.get("arriving_effects", [])},
+		"initial_state": initial_state,
 		"loadouts": [{"trainer": 0, "slots": ["Attack", "Defense", "Run", "Empty", "Empty", "Empty", "Empty", "Empty"]},
 			{"trainer": 1, "slots": ["Attack", "Defense", "Run", "Empty", "Empty", "Empty", "Empty", "Empty"]}],
 		"compiled_ticks": content.compiled,
@@ -297,6 +321,9 @@ func _process(delta: float) -> void:
 		backlog_ticks = maxi(0, backlog_ticks - 1)
 		sim.step()
 		steps += 1
+		if presentation != null:
+			presentation.receive_public_snapshot(sim.presentation_view_for_human())
+		_sync_own_life()
 		if sim.ended:
 			_finish_run()
 			break
@@ -306,6 +333,20 @@ func _process(delta: float) -> void:
 	frame_ms_samples.append(float(f1 - f0) / 1000.0)
 	if frame_ms_samples.size() > 20000:
 		frame_ms_samples.pop_front()
+
+
+func _sync_own_life() -> void:
+	if sim == null:
+		return
+	var life := int(sim.actors[0]["life_id"])
+	var alive := bool(sim.actors[0]["alive"])
+	if life != last_own_life_id or alive != last_own_alive:
+		# A delivered own life transition clears pre-KO held/staged input. Sequences are not reset.
+		held_keys.clear()
+		stage_mono_queue.clear()
+		stage_request_queue.clear()
+		last_own_life_id = life
+		last_own_alive = alive
 
 
 func _finish_run() -> void:
@@ -328,6 +369,10 @@ func submit_human_input(family: int) -> void:
 	if int(actor["control_mode"]) != 0:
 		_emit_reject_locally(family, "control")
 		return
+	if not bool(actor["alive"]):
+		# Truthful down feedback: never queued, never advances response RNG/Understood.
+		_emit_reject_locally(family, "life")
+		return
 	input_sequence[0] = int(input_sequence[0]) + 1
 	var raw := {
 		"schema": "m01.1", "trainer": 0, "actor": 0,
@@ -340,7 +385,7 @@ func submit_human_input(family: int) -> void:
 		stage_mono_queue.pop_front()
 	if presentation != null:
 		presentation.set_slot_flash(family - 1)
-	sim.gateway.stage(raw, sim.tick + 1)
+	sim.gateway.stage(raw, sim.tick + 1, int(actor["life_id"]))
 	cue_events.append({"tick": sim.tick, "kind": "request_sent", "family": family,
 		"mono": Time.get_ticks_usec()})
 	encounter_changed.emit()
